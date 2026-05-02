@@ -50,6 +50,7 @@ from .groot.configuration_groot import GrootConfig
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from .pi0.configuration_pi0 import PI0Config
 from .pi05.configuration_pi05 import PI05Config
+from .pi05_vggt_3d_mix.configuration_pi05_vggt_3d_mix import PI05VGGT3DMixConfig
 from .pretrained import PreTrainedPolicy
 from .sac.configuration_sac import SACConfig
 from .smolvla.configuration_smolvla import SmolVLAConfig
