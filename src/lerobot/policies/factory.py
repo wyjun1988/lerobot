@@ -127,6 +127,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .pi05.modeling_pi05 import PI05Policy
 
         return PI05Policy
+    elif name == "pi05_vggt_3d_mix":
+        from .pi05_vggt_3d_mix.modeling_pi05_vggt_3d_mix import PI05VGGT3DMixPolicy
+
+        return PI05VGGT3DMixPolicy
     elif name == "sac":
         from .sac.modeling_sac import SACPolicy
 
@@ -187,6 +191,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI0Config(**kwargs)
     elif policy_type == "pi05":
         return PI05Config(**kwargs)
+    elif policy_type == "pi05_vggt_3d_mix":
+        return PI05VGGT3DMixConfig(**kwargs)
     elif policy_type == "sac":
         return SACConfig(**kwargs)
     elif policy_type == "smolvla":
@@ -347,6 +353,18 @@ def make_pre_post_processors(
         from .pi0.processor_pi0 import make_pi0_pre_post_processors
 
         processors = make_pi0_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, PI05VGGT3DMixConfig):
+        # Must come BEFORE the PI05Config branch since PI05VGGT3DMixConfig
+        # subclasses PI05Config — isinstance(cfg, PI05Config) is True for both.
+        from .pi05_vggt_3d_mix.processor_pi05_vggt_3d_mix import (
+            make_pi05_vggt_3d_mix_pre_post_processors,
+        )
+
+        processors = make_pi05_vggt_3d_mix_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
