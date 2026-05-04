@@ -292,32 +292,80 @@ def _shard_worker_path() -> Path:
     return Path(__file__).resolve().parent / "eval_libero_plus_shard_worker.py"
 
 
-def _shard_env(gpu_id: str) -> dict[str, str]:
+def _shard_env(gpu_id: str, all_gpus: list[str]) -> dict[str, str]:
     """Per-shard environment: pin CUDA + EGL to the same physical GPU.
 
-    On NVIDIA hosts, ``CUDA_VISIBLE_DEVICES=N`` filters at the driver level —
-    so libEGL_nvidia only enumerates that one card, and addresses it as local
-    index 0 inside the shard. Setting ``MUJOCO_EGL_DEVICE_ID=N`` here would
-    fail with "must be an integer between 0 and 0 (inclusive)" because EGL's
-    valid range inside the shard is ``[0, 0]``.
+    Why we *don't* filter CUDA_VISIBLE_DEVICES per shard
+    ----------------------------------------------------
+    Two earlier attempts both failed against the actual H100 + LIBERO stack:
 
-    The earlier comment claiming "EGL enumerates devices independently from
-    CUDA" was wrong for NVIDIA: it does not. So the right pin is always 0
-    *within* the CUDA-filtered shard. Each shard's physical card is already
-    isolated by ``CUDA_VISIBLE_DEVICES``; the EGL id is just the index inside
-    that filtered set.
+    1. ``CVD=$gpu_id``, ``MEDI=$gpu_id`` (original) → MuJoCo's *C++* EGL init
+       (the ``mujoco.Renderer`` path used by ``--check-egl``) computes
+       ``numDevices`` from the CUDA-filtered EGL enumeration (=1) and rejects
+       ``MEDI=N`` for any N>0 with "must be an integer between 0 and 0
+       (inclusive)".
+    2. ``CVD=$gpu_id``, ``MEDI=0`` → MuJoCo's *Python* EGL wrapper (the path
+       LIBERO/robosuite go through during real eval) parses
+       ``CUDA_VISIBLE_DEVICES`` and requires MEDI to be one of the values in
+       it. ``0 ∉ {1}`` fails with "needs to be set to one of the device IDs
+       specified in CUDA_VISIBLE_DEVICES."
+
+    Both checks can't be satisfied simultaneously when CVD is filtered to a
+    single id per shard. The fix is to keep CVD as the *full* set of selected
+    GPUs across all shards (so the Python wrapper sees a list it can
+    membership-check, and the C++ ``numDevices`` is large enough), and
+    isolate per-shard CUDA via ``torch.cuda.set_device(rank)`` inside the
+    worker. ``MEDI=$gpu_id`` then matches one of the CVD values, the wrapper
+    renumbers it to its index, and the C++ side is happy too.
+
+    The shard worker MUST call ``torch.cuda.set_device`` before any CUDA
+    allocation; we forward ``--cuda-rank`` so it can.
+    """
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(all_gpus)
+    env.setdefault("MUJOCO_GL", "egl")
+    env["MUJOCO_EGL_DEVICE_ID"] = gpu_id
+    env["EGL_DEVICE_ID"] = gpu_id
+    return env
+
+
+def _cuda_rank_in(gpu_id: str, all_gpus: list[str]) -> int:
+    """Index of ``gpu_id`` in the ordered ``all_gpus`` list.
+
+    With ``CUDA_VISIBLE_DEVICES`` set to ``",".join(all_gpus)``, PyTorch
+    re-numbers physical devices to ``cuda:0..K-1`` in CVD order. The shard's
+    physical card is at this position; the worker must ``set_device(rank)``
+    before any CUDA op, otherwise tensors land on whichever device PyTorch
+    happens to default to (typically cuda:0 = first CVD value, causing every
+    shard to collide on one card).
+    """
+    return all_gpus.index(gpu_id)
+
+
+def _shard_env_legacy(gpu_id: str) -> dict[str, str]:
+    """Env for the legacy ``--use-lerobot-eval`` path: filter CVD per shard.
+
+    The legacy path spawns ``lerobot-eval`` subprocesses that don't know about
+    ``--cuda-rank``, so we can't use the worker-mode trick. Instead we filter
+    CUDA per shard (the original setup) and let LIBERO/robosuite go through
+    MuJoCo's Python EGL wrapper, which membership-checks ``MEDI`` against CVD
+    and renumbers it internally — that works fine when CVD has a single value.
+    The pre-flight ``--check-egl`` snippet (which exercises the C++ raw path
+    via ``mujoco.Renderer`` and would fail under filtered CVD) is run with
+    the *worker-mode* env, not this one, so the divergence is contained.
     """
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu_id
     env.setdefault("MUJOCO_GL", "egl")
-    env["MUJOCO_EGL_DEVICE_ID"] = "0"
-    env["EGL_DEVICE_ID"] = "0"
+    env["MUJOCO_EGL_DEVICE_ID"] = gpu_id
+    env["EGL_DEVICE_ID"] = gpu_id
     return env
 
 
 def run_shard_worker(
     shard_idx: int,
     gpu_id: str,
+    all_gpus: list[str],
     plan: list[tuple[str, list[int]]],
     worker_args: list[str],
     output_root: Path,
@@ -336,12 +384,14 @@ def run_shard_worker(
     plan_file = shard_dir / "plan.json"
     plan_file.write_text(json.dumps(plan, indent=2))
 
-    env = _shard_env(gpu_id)
+    env = _shard_env(gpu_id, all_gpus)
+    cuda_rank = _cuda_rank_in(gpu_id, all_gpus)
     cmd = [
         sys.executable,
         str(_shard_worker_path()),
         f"--plan-file={plan_file}",
         f"--output-dir={shard_dir}",
+        f"--cuda-rank={cuda_rank}",
         *worker_args,
     ]
 
@@ -392,6 +442,7 @@ def run_shard_worker(
 def run_shard_per_suite(
     shard_idx: int,
     gpu_id: str,
+    all_gpus: list[str],
     plan: list[tuple[str, list[int]]],
     forwarded_args: list[str],
     output_root: Path,
@@ -405,10 +456,11 @@ def run_shard_per_suite(
     init, processor setup) once per *suite*. Kept as ``--use-lerobot-eval``
     for debugging — the worker path (``run_shard_worker``) is the default.
     """
+    del all_gpus  # unused in legacy path; CVD is filtered per shard instead
     shard_dir = output_root / f"shard_{shard_idx:02d}_gpu_{gpu_id}"
     shard_dir.mkdir(parents=True, exist_ok=True)
     log_path = shard_dir / "shard.log"
-    env = _shard_env(gpu_id)
+    env = _shard_env_legacy(gpu_id)
 
     rc_total = 0
     started = time.time()
@@ -568,12 +620,11 @@ def check_egl_per_gpu(gpus: list[str]) -> list[tuple[str, bool, str]]:
     """For each GPU, spawn a child that binds an EGL display + a tiny MuJoCo
     scene on that physical device and reports success/failure.
 
-    Catches host configurations where CUDA_VISIBLE_DEVICES + MUJOCO_EGL_DEVICE_ID
-    don't agree on which physical card maps to which EGL id, before we burn an
-    hour on a doomed sweep. We set the EGL id to 0 inside each shard because
-    on NVIDIA hosts ``CUDA_VISIBLE_DEVICES`` filters at the driver level — only
-    one card is visible, addressed as local id 0. (Setting it to the global id
-    fails with "must be an integer between 0 and 0 (inclusive)".)
+    Uses the same env layout as the worker mode: ``CUDA_VISIBLE_DEVICES`` is
+    the *full* list of selected GPUs (so MuJoCo's Python wrapper accepts
+    ``MEDI`` as a member, then renumbers internally), and ``MEDI`` is the
+    global id of the GPU under test. The pre-flight binds whichever physical
+    card the wrapper resolves to — same logic the real shards will use.
     """
     snippet = (
         "import os, sys, json\n"
@@ -597,15 +648,15 @@ def check_egl_per_gpu(gpus: list[str]) -> list[tuple[str, bool, str]]:
         "    sys.exit(1)\n"
     )
     results: list[tuple[str, bool, str]] = []
+    cvd_all = ",".join(gpus)
     for gpu in gpus:
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = gpu
+        env["CUDA_VISIBLE_DEVICES"] = cvd_all
         env["MUJOCO_GL"] = "egl"
-        # See the comment in _shard_env: with CUDA_VISIBLE_DEVICES=N, NVIDIA's
-        # EGL only exposes that one card, indexed locally as 0. Use 0 here so
-        # the pre-flight matches what _shard_env does at sweep time.
-        env["MUJOCO_EGL_DEVICE_ID"] = "0"
-        env["EGL_DEVICE_ID"] = "0"
+        # MEDI is the global id; CVD lists all selected GPUs so the wrapper's
+        # membership check passes and it can renumber MEDI to its CVD index.
+        env["MUJOCO_EGL_DEVICE_ID"] = gpu
+        env["EGL_DEVICE_ID"] = gpu
         try:
             out = subprocess.check_output(
                 [sys.executable, "-c", snippet],
@@ -810,6 +861,7 @@ def main(argv: list[str] | None = None) -> int:
             args=(
                 i,
                 gpu,
+                gpus,
                 plan_i,
                 *runner_args,
                 args.output_dir,

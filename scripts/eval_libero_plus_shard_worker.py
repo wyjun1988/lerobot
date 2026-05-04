@@ -145,7 +145,26 @@ def main(argv: list[str] | None = None) -> int:
         help="JSON dict, e.g. '{\"observation.images.image\": \"observation.images.cam0\"}'.",
     )
     p.add_argument("--trust-remote-code", action="store_true")
+    p.add_argument(
+        "--cuda-rank",
+        type=int,
+        default=None,
+        help="Index of this shard's GPU within CUDA_VISIBLE_DEVICES. The "
+        "launcher leaves CVD as the full set of selected GPUs across all "
+        "shards (so MuJoCo's EGL wrapper can membership-check + renumber "
+        "MUJOCO_EGL_DEVICE_ID), and uses --cuda-rank to tell each worker "
+        "which physical card to pin its CUDA tensors to. Without this, all "
+        "shards default to cuda:0 and collide.",
+    )
     args = p.parse_args(argv)
+
+    # Pin CUDA to this shard's physical GPU BEFORE any other CUDA op (policy
+    # construction, dataset_stats tensors, etc). After this, ``cfg.device =
+    # "cuda"`` and ``torch.tensor(..., device="cuda")`` both land on the
+    # right card. Done early so even module-level CUDA touches from imports
+    # below pick up the right default.
+    if args.cuda_rank is not None and torch.cuda.is_available():
+        torch.cuda.set_device(int(args.cuda_rank))
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     plan = json.loads(args.plan_file.read_text())

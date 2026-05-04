@@ -48,11 +48,12 @@ those (and refuses to start, rc=2, if you do).
 1. **GPU detection.** Reads `--gpus` → `CUDA_VISIBLE_DEVICES` → `nvidia-smi -L`.
 2. **Plan.** Probes LIBERO suite sizes in a child Python, then partitions
    `(suite, task_id)` tuples across shards.
-3. **Spawn.** One worker subprocess per GPU, with `CUDA_VISIBLE_DEVICES=k`
-   and `MUJOCO_EGL_DEVICE_ID=0`. CUDA filters the visible cards to one
-   physical GPU; EGL inside that filtered shard sees only one device,
-   addressed as local id `0`. (Setting `MUJOCO_EGL_DEVICE_ID=k` would fail
-   with "must be an integer between 0 and 0 (inclusive)".)
+3. **Spawn.** One worker subprocess per GPU. All workers share the same
+   `CUDA_VISIBLE_DEVICES=<all selected GPUs>` so MuJoCo's Python EGL wrapper
+   can membership-check `MUJOCO_EGL_DEVICE_ID` against the CVD list. Each
+   worker is told which physical card to pin its CUDA tensors to via
+   `--cuda-rank=<index in CVD>`, which the worker honors by calling
+   `torch.cuda.set_device(rank)` before any CUDA op.
 4. **Worker.** Each worker loads the policy + processors **once**, then
    loops the shard's plan calling `cfg.create_envs()` + `eval_policy_all`
    per `(suite, task_ids)` entry.
@@ -60,16 +61,32 @@ those (and refuses to start, rc=2, if you do).
    re-aggregated from per-episode booleans into a single global report.
 
 <Tip warning={true}>
-**EGL device id on NVIDIA hosts is local to the CUDA-filtered shard.**
-With `CUDA_VISIBLE_DEVICES=k`, NVIDIA's EGL only enumerates that one card
-and indexes it as `0` — so the right pin is `MUJOCO_EGL_DEVICE_ID=0` per
-shard, not `MUJOCO_EGL_DEVICE_ID=k`. The launcher sets this for you. If
-you ever spawn `lerobot-eval` shards manually, set
-`CUDA_VISIBLE_DEVICES=$gpu_id MUJOCO_EGL_DEVICE_ID=0` per shard. Pinning
-to `$gpu_id` (which an earlier version of this guide recommended) fails
-with `"MUJOCO_EGL_DEVICE_ID must be an integer between 0 and 0
-(inclusive)"` on every shard except the one that happens to land on
-GPU 0.
+**Don't filter `CUDA_VISIBLE_DEVICES` per shard.** MuJoCo enforces two
+contradictory rules across its C++ and Python EGL paths:
+* The C++ raw path (used by `mujoco.Renderer`, e.g. in `--check-egl`)
+  computes `numDevices` from the CUDA-filtered EGL count and rejects
+  `MUJOCO_EGL_DEVICE_ID=k` for any `k>0` with
+  `"must be an integer between 0 and 0 (inclusive)"`.
+* The Python EGL wrapper (used by LIBERO/robosuite during real eval)
+  parses `CUDA_VISIBLE_DEVICES` and requires `MUJOCO_EGL_DEVICE_ID` to
+  be one of the values listed in it; setting `MUJOCO_EGL_DEVICE_ID=0`
+  with `CVD=k>0` fails with
+  `"MUJOCO_EGL_DEVICE_ID needs to be set to one of the device IDs
+  specified in CUDA_VISIBLE_DEVICES"`.
+
+Both checks can't be satisfied if CVD is filtered to a single id per
+shard. The launcher works around this by keeping CVD as the **full set**
+of selected GPUs across all shards, setting `MUJOCO_EGL_DEVICE_ID=$gpu_id`
+(the global id, which IS in the CVD list — wrapper happy), and isolating
+CUDA per shard via `torch.cuda.set_device(rank)` inside the worker
+(forwarded as `--cuda-rank`).
+
+If you ever spawn shards manually, mirror this layout:
+`CUDA_VISIBLE_DEVICES=0,1,2,3 MUJOCO_EGL_DEVICE_ID=$gpu_id` plus an
+explicit `cuda:rank` device. The legacy `--use-lerobot-eval` path still
+filters CVD per shard because it can't pass `--cuda-rank` to the spawned
+`lerobot-eval` subprocesses; LIBERO going through the wrapper is fine
+with single-element CVD.
 </Tip>
 
 ## Pre-flight checks
@@ -278,13 +295,13 @@ then `cp -r` the new shard back into the original `--output-dir` and
 
 ### Only one GPU shows activity, others are idle or crash
 
-EGL collision. Run `--check-egl` to confirm each GPU can independently
-bind a context. The launcher sets `CUDA_VISIBLE_DEVICES=$gpu_id` and
-`MUJOCO_EGL_DEVICE_ID=0` per shard — the EGL id is local to the
-CUDA-filtered shard, not the global GPU id (see the EGL pinning tip
-above). On heterogeneous boxes (iGPU + dGPU, multi-vendor) the
-EGL-to-CUDA enumeration order can drift; override `EGL_DEVICE_ID=0` and
-`MUJOCO_EGL_DEVICE_ID=0` in the parent shell to be explicit.
+All shards landing on cuda:0. The launcher relies on the worker calling
+`torch.cuda.set_device(rank)` early; if you've patched the worker or
+are using a stale checkpoint of it, every shard will default to cuda:0
+because CVD lists all selected GPUs and PyTorch's default is the first.
+Run `--check-egl` to confirm each GPU can independently bind a context,
+then check `<output-dir>/shard_*/shard.log` — every shard should log a
+non-zero `--cuda-rank=N` in its launch command.
 
 ### `EGL_BAD_DISPLAY` / `EGL_BAD_CONTEXT` in shard logs
 

@@ -170,25 +170,52 @@ def test_translate_unknown_args_are_reported(launcher):
 
 
 # ---------------------------------------------------------------------------
-# _shard_env (CUDA + EGL pinning)
+# _shard_env (CUDA + EGL pinning) — worker mode
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("gpu_id", ["0", "1", "3", "7"])
-def test_shard_env_pins_cuda_to_global_id_and_egl_to_zero(launcher, gpu_id):
-    """Regression test for the EGL pinning bug.
-
-    On NVIDIA, ``CUDA_VISIBLE_DEVICES=N`` filters at the driver level — the
-    shard sees one card, indexed locally as 0. ``MUJOCO_EGL_DEVICE_ID`` must
-    therefore be ``"0"`` inside the shard, not the global GPU id; otherwise
-    MuJoCo errors with "must be an integer between 0 and 0 (inclusive)" on
-    every shard except the one that happens to map to GPU 0.
-    """
-    env = launcher._shard_env(gpu_id)
-    assert env["CUDA_VISIBLE_DEVICES"] == gpu_id
-    assert env["MUJOCO_EGL_DEVICE_ID"] == "0"
-    assert env["EGL_DEVICE_ID"] == "0"
+def test_shard_env_worker_keeps_full_cvd_and_uses_global_egl_id(launcher, gpu_id):
+    """Worker-mode env: CVD stays the full selected-GPU list (so MuJoCo's
+    Python EGL wrapper can membership-check MEDI), and MEDI is the global GPU
+    id (which the wrapper renumbers to its CVD index internally). Per-shard
+    CUDA isolation is then handled by ``--cuda-rank`` + ``set_device``, NOT
+    by filtering CVD."""
+    all_gpus = ["0", "1", "3", "7"]
+    env = launcher._shard_env(gpu_id, all_gpus)
+    assert env["CUDA_VISIBLE_DEVICES"] == "0,1,3,7"
+    assert env["MUJOCO_EGL_DEVICE_ID"] == gpu_id
+    assert env["EGL_DEVICE_ID"] == gpu_id
     assert env["MUJOCO_GL"] == "egl"
+
+
+def test_shard_env_legacy_filters_cvd_per_shard(launcher):
+    """Legacy ``--use-lerobot-eval`` env: filters CVD per shard because the
+    spawned ``lerobot-eval`` subprocesses don't know about ``--cuda-rank``.
+    Relies on LIBERO going through MuJoCo's Python EGL wrapper, which is fine
+    with single-element CVD."""
+    env = launcher._shard_env_legacy("3")
+    assert env["CUDA_VISIBLE_DEVICES"] == "3"
+    assert env["MUJOCO_EGL_DEVICE_ID"] == "3"
+    assert env["EGL_DEVICE_ID"] == "3"
+
+
+@pytest.mark.parametrize(
+    "gpu_id,all_gpus,expected",
+    [
+        ("0", ["0", "1", "2", "3"], 0),
+        ("1", ["0", "1", "2", "3"], 1),
+        ("3", ["0", "1", "2", "3"], 3),
+        ("3", ["0", "3"], 1),  # sparse: rank is the index, not the global id
+        ("7", ["7"], 0),  # single-GPU shard
+    ],
+)
+def test_cuda_rank_in_returns_local_index(launcher, gpu_id, all_gpus, expected):
+    """The local CUDA rank must equal the shard's GPU position in the CVD list,
+    NOT the global GPU id. ``torch.cuda.set_device(rank)`` then maps the
+    shard's tensors to the right physical card after CVD reordering.
+    """
+    assert launcher._cuda_rank_in(gpu_id, all_gpus) == expected
 
 
 # ---------------------------------------------------------------------------
