@@ -48,9 +48,11 @@ those (and refuses to start, rc=2, if you do).
 1. **GPU detection.** Reads `--gpus` → `CUDA_VISIBLE_DEVICES` → `nvidia-smi -L`.
 2. **Plan.** Probes LIBERO suite sizes in a child Python, then partitions
    `(suite, task_id)` tuples across shards.
-3. **Spawn.** One worker subprocess per GPU, with
-   `CUDA_VISIBLE_DEVICES=k` **and** `MUJOCO_EGL_DEVICE_ID=k` so CUDA tensors
-   and EGL framebuffers live on the same physical card.
+3. **Spawn.** One worker subprocess per GPU, with `CUDA_VISIBLE_DEVICES=k`
+   and `MUJOCO_EGL_DEVICE_ID=0`. CUDA filters the visible cards to one
+   physical GPU; EGL inside that filtered shard sees only one device,
+   addressed as local id `0`. (Setting `MUJOCO_EGL_DEVICE_ID=k` would fail
+   with "must be an integer between 0 and 0 (inclusive)".)
 4. **Worker.** Each worker loads the policy + processors **once**, then
    loops the shard's plan calling `cfg.create_envs()` + `eval_policy_all`
    per `(suite, task_ids)` entry.
@@ -58,12 +60,16 @@ those (and refuses to start, rc=2, if you do).
    re-aggregated from per-episode booleans into a single global report.
 
 <Tip warning={true}>
-**EGL pinning is not optional on multi-GPU.**
-`CUDA_VISIBLE_DEVICES` only restricts what CUDA sees. EGL enumerates GPUs
-independently via the NVIDIA driver, so without `MUJOCO_EGL_DEVICE_ID`
-every shard binds to EGL device 0 and they all collide on physical GPU 0.
-The launcher sets this for you. If you ever spawn `lerobot-eval` shards
-manually, set `MUJOCO_EGL_DEVICE_ID=$gpu_id` per shard.
+**EGL device id on NVIDIA hosts is local to the CUDA-filtered shard.**
+With `CUDA_VISIBLE_DEVICES=k`, NVIDIA's EGL only enumerates that one card
+and indexes it as `0` — so the right pin is `MUJOCO_EGL_DEVICE_ID=0` per
+shard, not `MUJOCO_EGL_DEVICE_ID=k`. The launcher sets this for you. If
+you ever spawn `lerobot-eval` shards manually, set
+`CUDA_VISIBLE_DEVICES=$gpu_id MUJOCO_EGL_DEVICE_ID=0` per shard. Pinning
+to `$gpu_id` (which an earlier version of this guide recommended) fails
+with `"MUJOCO_EGL_DEVICE_ID must be an integer between 0 and 0
+(inclusive)"` on every shard except the one that happens to land on
+GPU 0.
 </Tip>
 
 ## Pre-flight checks
@@ -271,11 +277,13 @@ then `cp -r` the new shard back into the original `--output-dir` and
 
 ### Only one GPU shows activity, others are idle or crash
 
-EGL collision. Check that `MUJOCO_EGL_DEVICE_ID` is being set per shard
-(it should be — the launcher does this). Run `--check-egl` to confirm
-each GPU can independently bind a context. On heterogeneous boxes (iGPU
-+ dGPU, multi-vendor) the EGL-to-CUDA index mapping can drift; override
-`MUJOCO_EGL_DEVICE_ID` in the parent shell before launching.
+EGL collision. Run `--check-egl` to confirm each GPU can independently
+bind a context. The launcher sets `CUDA_VISIBLE_DEVICES=$gpu_id` and
+`MUJOCO_EGL_DEVICE_ID=0` per shard — the EGL id is local to the
+CUDA-filtered shard, not the global GPU id (see the EGL pinning tip
+above). On heterogeneous boxes (iGPU + dGPU, multi-vendor) the
+EGL-to-CUDA enumeration order can drift; override `EGL_DEVICE_ID=0` and
+`MUJOCO_EGL_DEVICE_ID=0` in the parent shell to be explicit.
 
 ### `EGL_BAD_DISPLAY` / `EGL_BAD_CONTEXT` in shard logs
 

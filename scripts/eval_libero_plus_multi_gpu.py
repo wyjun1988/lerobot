@@ -290,16 +290,23 @@ def _shard_worker_path() -> Path:
 def _shard_env(gpu_id: str) -> dict[str, str]:
     """Per-shard environment: pin CUDA + EGL to the same physical GPU.
 
-    See the long comment that used to live inline in run_shard for why both
-    CUDA_VISIBLE_DEVICES *and* MUJOCO_EGL_DEVICE_ID are needed (EGL enumerates
-    devices independently from CUDA, so without the EGL pin every shard
-    collides on EGL device 0).
+    On NVIDIA hosts, ``CUDA_VISIBLE_DEVICES=N`` filters at the driver level —
+    so libEGL_nvidia only enumerates that one card, and addresses it as local
+    index 0 inside the shard. Setting ``MUJOCO_EGL_DEVICE_ID=N`` here would
+    fail with "must be an integer between 0 and 0 (inclusive)" because EGL's
+    valid range inside the shard is ``[0, 0]``.
+
+    The earlier comment claiming "EGL enumerates devices independently from
+    CUDA" was wrong for NVIDIA: it does not. So the right pin is always 0
+    *within* the CUDA-filtered shard. Each shard's physical card is already
+    isolated by ``CUDA_VISIBLE_DEVICES``; the EGL id is just the index inside
+    that filtered set.
     """
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu_id
     env.setdefault("MUJOCO_GL", "egl")
-    env.setdefault("MUJOCO_EGL_DEVICE_ID", gpu_id)
-    env.setdefault("EGL_DEVICE_ID", gpu_id)
+    env["MUJOCO_EGL_DEVICE_ID"] = "0"
+    env["EGL_DEVICE_ID"] = "0"
     return env
 
 
@@ -556,8 +563,12 @@ def check_egl_per_gpu(gpus: list[str]) -> list[tuple[str, bool, str]]:
     """For each GPU, spawn a child that binds an EGL display + a tiny MuJoCo
     scene on that physical device and reports success/failure.
 
-    This catches the "all shards collide on EGL device 0" failure mode before
-    we burn an hour on a doomed sweep.
+    Catches host configurations where CUDA_VISIBLE_DEVICES + MUJOCO_EGL_DEVICE_ID
+    don't agree on which physical card maps to which EGL id, before we burn an
+    hour on a doomed sweep. We set the EGL id to 0 inside each shard because
+    on NVIDIA hosts ``CUDA_VISIBLE_DEVICES`` filters at the driver level — only
+    one card is visible, addressed as local id 0. (Setting it to the global id
+    fails with "must be an integer between 0 and 0 (inclusive)".)
     """
     snippet = (
         "import os, sys, json\n"
@@ -585,8 +596,11 @@ def check_egl_per_gpu(gpus: list[str]) -> list[tuple[str, bool, str]]:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = gpu
         env["MUJOCO_GL"] = "egl"
-        env["MUJOCO_EGL_DEVICE_ID"] = gpu
-        env["EGL_DEVICE_ID"] = gpu
+        # See the comment in _shard_env: with CUDA_VISIBLE_DEVICES=N, NVIDIA's
+        # EGL only exposes that one card, indexed locally as 0. Use 0 here so
+        # the pre-flight matches what _shard_env does at sweep time.
+        env["MUJOCO_EGL_DEVICE_ID"] = "0"
+        env["EGL_DEVICE_ID"] = "0"
         try:
             out = subprocess.check_output(
                 [sys.executable, "-c", snippet],

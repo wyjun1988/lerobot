@@ -161,6 +161,28 @@ def test_translate_unknown_args_are_reported(launcher):
 
 
 # ---------------------------------------------------------------------------
+# _shard_env (CUDA + EGL pinning)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("gpu_id", ["0", "1", "3", "7"])
+def test_shard_env_pins_cuda_to_global_id_and_egl_to_zero(launcher, gpu_id):
+    """Regression test for the EGL pinning bug.
+
+    On NVIDIA, ``CUDA_VISIBLE_DEVICES=N`` filters at the driver level — the
+    shard sees one card, indexed locally as 0. ``MUJOCO_EGL_DEVICE_ID`` must
+    therefore be ``"0"`` inside the shard, not the global GPU id; otherwise
+    MuJoCo errors with "must be an integer between 0 and 0 (inclusive)" on
+    every shard except the one that happens to map to GPU 0.
+    """
+    env = launcher._shard_env(gpu_id)
+    assert env["CUDA_VISIBLE_DEVICES"] == gpu_id
+    assert env["MUJOCO_EGL_DEVICE_ID"] == "0"
+    assert env["EGL_DEVICE_ID"] == "0"
+    assert env["MUJOCO_GL"] == "egl"
+
+
+# ---------------------------------------------------------------------------
 # merge_results
 # ---------------------------------------------------------------------------
 
