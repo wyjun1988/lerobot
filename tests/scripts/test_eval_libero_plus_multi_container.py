@@ -280,16 +280,17 @@ def test_merge_errors_on_empty_dir(mod, tmp_path):
     [
         # Base / unperturbed task
         ("KITCHEN_SCENE2_open_the_top_drawer", "clean"),
-        # 7 perturbation axes from the LIBERO-plus paper:
+        # 5 perturbation axes registered for this fork:
         ("KITCHEN_SCENE_view_top_camera", "camera"),
-        ("KITCHEN_SCENE_language_paraphrase_v1", "language"),
         ("KITCHEN_SCENE_light_dark", "lighting"),
         ("KITCHEN_SCENE_tb_3", "background"),
         ("KITCHEN_SCENE_table_2", "background"),
         ("KITCHEN_SCENE_add_obj_carrot", "object_added"),
         ("KITCHEN_SCENE_level1", "object_layout"),
-        ("KITCHEN_SCENE_robot_init_offset", "robot_init"),
-        ("KITCHEN_SCENE_noise_imgnoise_high", "sensor_noise"),
+        # Suffixes not in this fork's task filenames -> "clean" (no pattern):
+        ("KITCHEN_SCENE_language_paraphrase_v1", "clean"),
+        ("KITCHEN_SCENE_robot_init_offset", "clean"),
+        ("KITCHEN_SCENE_noise_imgnoise_high", "clean"),
     ],
 )
 def test_categorize_task_recognizes_libero_plus_perturbation_axes(mod, name, expected):
@@ -327,7 +328,7 @@ def test_aggregate_by_perturbation_pools_episode_booleans(mod):
         {
             "task_group": "libero_spatial",
             "task_id": 2,
-            "perturbation": "language",
+            "perturbation": "lighting",
             "metrics": {
                 "successes": [True, True],
                 "sum_rewards": [1.0, 1.0],
@@ -342,9 +343,9 @@ def test_aggregate_by_perturbation_pools_episode_booleans(mod):
     assert out["camera"]["n_episodes"] == 4
     assert out["camera"]["pc_success"] == pytest.approx(25.0)
 
-    # 2 / 2 for language = 100.0
-    assert out["language"]["n_episodes"] == 2
-    assert out["language"]["pc_success"] == pytest.approx(100.0)
+    # 2 / 2 for lighting = 100.0
+    assert out["lighting"]["n_episodes"] == 2
+    assert out["lighting"]["pc_success"] == pytest.approx(100.0)
 
 
 def test_attach_perturbation_categories_skips_when_libero_missing(mod, monkeypatch):
@@ -399,13 +400,13 @@ def test_merge_with_perturbation_breakdown_via_monkeypatch(mod, tmp_path, monkey
         ],
     )
 
-    # Stub LIBERO so task_id=0 -> camera, task_id=1 -> language.
+    # Stub LIBERO so task_id=0 -> camera, task_id=1 -> lighting.
     class _Task:
         def __init__(self, name):
             self.name = name
 
     class _Suite:
-        tasks = [_Task("KITCHEN_view_top"), _Task("KITCHEN_language_paraphrase")]
+        tasks = [_Task("KITCHEN_view_top"), _Task("KITCHEN_light_dark")]
 
     fake_benchmark_dict = {"libero_spatial": _Suite}
 
@@ -432,10 +433,10 @@ def test_merge_with_perturbation_breakdown_via_monkeypatch(mod, tmp_path, monkey
     assert merged["per_group"]["libero_spatial"]["n_episodes"] == 3
     # New per_perturbation breakdown by category:
     assert "camera" in merged["per_perturbation"]
-    assert "language" in merged["per_perturbation"]
+    assert "lighting" in merged["per_perturbation"]
     # camera = task 0 = 1/2 = 50%
     assert merged["per_perturbation"]["camera"]["n_episodes"] == 2
     assert merged["per_perturbation"]["camera"]["pc_success"] == pytest.approx(50.0)
-    # language = task 1 = 0/1 = 0%
-    assert merged["per_perturbation"]["language"]["n_episodes"] == 1
-    assert merged["per_perturbation"]["language"]["pc_success"] == pytest.approx(0.0)
+    # lighting = task 1 = 0/1 = 0%
+    assert merged["per_perturbation"]["lighting"]["n_episodes"] == 1
+    assert merged["per_perturbation"]["lighting"]["pc_success"] == pytest.approx(0.0)

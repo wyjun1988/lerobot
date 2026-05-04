@@ -85,33 +85,40 @@ log = logging.getLogger("multi_container")
 # LIBERO-plus perturbation categorization
 # ---------------------------------------------------------------------------
 #
-# LIBERO-plus encodes each variant's perturbation in the task filename. Each
-# category corresponds to one axis of the paper's 7 perturbation dimensions.
-# Patterns are matched in order; first hit wins. ``None`` => unperturbed
-# variant (a base task that isn't a perturbation of anything).
+# LIBERO-plus encodes each variant's perturbation in the task filename.
+# Patterns are matched in order; first hit wins. The fork we evaluate against
+# defines five axes:
 #
-# References:
-#   - LIBERO-plus paper (arXiv:2502.00064) §3 lists the seven axes.
-#   - The init-state suffix-stripping regex in src/lerobot/envs/libero.py:64
-#     covers the language / view / light / table / tb encodings.
-#   - Object-layout variants live under libero_newobj/ and use _add_ / _level
-#     filenames; see src/lerobot/envs/libero.py:78 for the dispatch.
+#   camera         — _view_*   (alternate camera viewpoints)
+#   background     — _tb_N / _table_N  (table textures / scene background)
+#   lighting       — _light_*  (lighting changes)
+#   object_added   — _add_*    (extra distractor objects, layout in libero_newobj/)
+#   object_layout  — _level*   (alternate object placements, also in libero_newobj/)
+#
+# Tasks without any of these suffixes are unperturbed bases ("clean").
+#
+# Note: the published LIBERO-plus paper lists seven axes including language
+# paraphrases, robot initial states, and sensor noise — those aren't in this
+# fork's task filenames (probably injected at runtime in other forks). If your
+# fork adds more axes, append patterns here and the merge will pick them up
+# automatically; tasks with new suffixes will simply land in "clean" until
+# their pattern is registered.
+#
+# Cross-reference: src/lerobot/envs/libero.py:64 has a similar regex used to
+# strip these suffixes when locating the shared init-state file on disk.
 PERTURBATION_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"_view_"), "camera"),
-    (re.compile(r"_language_"), "language"),
-    (re.compile(r"_light_"), "lighting"),
     (re.compile(r"_(?:tb|table)_\d+"), "background"),
+    (re.compile(r"_light_"), "lighting"),
     (re.compile(r"_add_"), "object_added"),
     (re.compile(r"_level\d*"), "object_layout"),
-    (re.compile(r"_robot_"), "robot_init"),
-    (re.compile(r"_noise_"), "sensor_noise"),
 ]
 
 
 def categorize_task(task_name: str) -> str:
     """Map a LIBERO-plus task filename to its perturbation category.
 
-    Returns one of the seven category strings or ``"clean"`` when no known
+    Returns one of the five category strings or ``"clean"`` when no known
     perturbation suffix is present (the unperturbed base variant).
     """
     for pat, cat in PERTURBATION_PATTERNS:
@@ -488,10 +495,9 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Don't compute the LIBERO-plus per-perturbation aggregation. "
         "Default: compute it whenever LIBERO is importable (set PYTHONPATH "
-        "to include LIBERO-plus). The breakdown groups tasks by the 7 "
-        "perturbation axes (camera, language, lighting, background, "
-        "object_added, object_layout, robot_init, sensor_noise) plus 'clean' "
-        "for unperturbed bases.",
+        "to include LIBERO-plus). The breakdown groups tasks by the 5 "
+        "perturbation axes this fork supports (camera, background, lighting, "
+        "object_added, object_layout) plus 'clean' for unperturbed bases.",
     )
 
     args = p.parse_args(argv)
