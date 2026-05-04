@@ -40,6 +40,7 @@ import json
 import logging
 import sys
 import time
+import traceback
 from collections import defaultdict
 from contextlib import nullcontext
 from pathlib import Path
@@ -248,6 +249,18 @@ def main(argv: list[str] | None = None) -> int:
                 )
             except Exception:  # noqa: BLE001 — log + continue across suites
                 log.exception("Suite %s failed; continuing with next suite.", suite)
+                # log.exception relies on the configured logging handler
+                # picking up exc_info; lerobot's init_logging() format string
+                # has historically dropped tracebacks on this code path. Force
+                # a copy to stderr AND a per-suite error file so the actual
+                # exception is always recoverable from the shard output.
+                tb_text = traceback.format_exc()
+                print(f"\n===== Suite {suite} traceback =====\n{tb_text}", file=sys.stderr, flush=True)
+                err_path = args.output_dir / f"error_{suite}.txt"
+                try:
+                    err_path.write_text(tb_text)
+                except OSError:
+                    pass
                 # eval_policy_all closes envs internally, but in the failure
                 # path it may not have. Best-effort cleanup:
                 try:
