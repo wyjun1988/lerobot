@@ -1,0 +1,312 @@
+# LIBERO-plus multi-GPU evaluation
+
+A full LIBERO-plus sweep runs every (suite, task_id, episode) tuple
+sequentially through one device. On a single H100 that takes several days.
+The launcher under `scripts/eval_libero_plus_multi_gpu.py` shards the work
+across all visible GPUs and brings the wall time down to roughly
+`single_gpu_time / num_gpus`.
+
+This page is the operational manual for that launcher. For the underlying
+benchmark and policy setup, see [LIBERO-plus](./libero_plus).
+
+## When to use this
+
+Use the multi-GPU launcher when:
+
+- You have ≥ 2 GPUs and want near-linear speedup on `lerobot-eval`.
+- You're running the full default sweep (`libero_spatial,libero_object,libero_goal,libero_10`)
+  or any large subset.
+
+Stick with plain `lerobot-eval` when:
+
+- You have one GPU.
+- You're debugging a single suite with `--env.task_ids=[0]` — the launcher
+  adds startup overhead that isn't worth it for a one-task run.
+
+## Quickstart
+
+```bash
+cd lerobot
+python scripts/eval_libero_plus_multi_gpu.py \
+    --output-dir outputs/eval/libero_plus_multi \
+    -- \
+    --policy.path=lerobot/your_policy \
+    --eval.n_episodes=10 \
+    --eval.batch_size=1 \
+    --env.max_parallel_tasks=1 \
+    --policy.device=cuda \
+    --policy.use_amp=false
+```
+
+Everything before `--` configures the launcher; everything after `--` is
+forwarded verbatim to each shard. **Don't** pass `--env.type`, `--env.task`,
+`--env.task_ids`, or `--output_dir` after the `--` — the launcher controls
+those (and refuses to start, rc=2, if you do).
+
+## How it works
+
+1. **GPU detection.** Reads `--gpus` → `CUDA_VISIBLE_DEVICES` → `nvidia-smi -L`.
+2. **Plan.** Probes LIBERO suite sizes in a child Python, then partitions
+   `(suite, task_id)` tuples across shards.
+3. **Spawn.** One worker subprocess per GPU, with
+   `CUDA_VISIBLE_DEVICES=k` **and** `MUJOCO_EGL_DEVICE_ID=k` so CUDA tensors
+   and EGL framebuffers live on the same physical card.
+4. **Worker.** Each worker loads the policy + processors **once**, then
+   loops the shard's plan calling `cfg.create_envs()` + `eval_policy_all`
+   per `(suite, task_ids)` entry.
+5. **Merge.** When all shards finish, per-shard `eval_info.json` files are
+   re-aggregated from per-episode booleans into a single global report.
+
+<Tip warning={true}>
+**EGL pinning is not optional on multi-GPU.**
+`CUDA_VISIBLE_DEVICES` only restricts what CUDA sees. EGL enumerates GPUs
+independently via the NVIDIA driver, so without `MUJOCO_EGL_DEVICE_ID`
+every shard binds to EGL device 0 and they all collide on physical GPU 0.
+The launcher sets this for you. If you ever spawn `lerobot-eval` shards
+manually, set `MUJOCO_EGL_DEVICE_ID=$gpu_id` per shard.
+</Tip>
+
+## Pre-flight checks
+
+### `--check-egl`
+
+Spawns a tiny MuJoCo render on each GPU using the same env-var setup the
+real shards will use. Catches EGL collisions in seconds rather than after
+hours of failed eval.
+
+```bash
+python scripts/eval_libero_plus_multi_gpu.py \
+    --output-dir /tmp/check --check-egl --dry-run \
+    -- --policy.path=lerobot/your_policy
+```
+
+A passing run prints `OK` per GPU. A failure prints the exception and exits
+rc=2 without launching the sweep.
+
+### `--dry-run`
+
+Prints the partition and the command each shard would run, then exits.
+Use this to verify your plan before committing to a multi-hour run.
+
+```bash
+python scripts/eval_libero_plus_multi_gpu.py \
+    --output-dir /tmp/dry --dry-run \
+    -- --policy.path=lerobot/your_policy --eval.n_episodes=10
+```
+
+### Smoke test
+
+Run the full pipeline on two task ids per suite (~2 min on H100) before
+committing to the full sweep:
+
+```bash
+python scripts/eval_libero_plus_multi_gpu.py \
+    --output-dir outputs/eval/smoke \
+    --task-ids 0,1 \
+    -- \
+    --policy.path=lerobot/your_policy \
+    --eval.n_episodes=2 \
+    --policy.device=cuda
+```
+
+## Launcher flags
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--output-dir` | (required) | Where shard outputs and merged report go |
+| `--gpus` | autodetect | `"0,1,4,5"` (subset) or `"4"` (count shorthand) |
+| `--suites` | 4 standard | Comma-separated LIBERO suite names |
+| `--task-ids` | all | `"0,1,2"` or per-suite `"libero_spatial=0,1;libero_10=3,4"` |
+| `--shard-by` | `task` | `task` (round-robin) or `suite` (whole suites per GPU) |
+| `--check-egl` | off | EGL pre-flight per GPU |
+| `--dry-run` | off | Print plan + commands, don't execute |
+| `--merge-only` | off | Skip launching, re-merge existing shard outputs |
+| `--use-lerobot-eval` | off | Legacy mode: spawn `lerobot-eval` per (shard, suite); pays model-load per suite |
+
+Forwarded args (after `--`) accepted in default worker mode:
+
+- `--policy.path`, `--policy.device`, `--policy.use_amp`
+- `--eval.n_episodes`, `--eval.batch_size`, `--eval.use_async_envs`
+- `--env.control_mode`, `--env.max_parallel_tasks`, `--env.episode_length`
+- `--seed`, `--rename_map`, `--trust_remote_code`
+
+Any other forwarded flag is rejected (rc=2). For draccus features outside
+this list, pass `--use-lerobot-eval` to fall back to the per-suite CLI path.
+
+## Sharding strategies
+
+`--shard-by task` (default, recommended):
+
+Round-robins each `(suite, task_id)` tuple across shards. Every shard
+gets a roughly even mix of suites, which keeps wall time balanced even
+when suites have very different costs (`libero_10`'s 520 max-steps vs
+`libero_spatial`'s 280).
+
+```text
+GPU 0: spatial[0,2,4,6,8] + object[0,2,4,6,8] + goal[0,2,4,6,8] + libero_10[0,2,4,6,8]
+GPU 1: spatial[1,3,5,7,9] + object[1,3,5,7,9] + goal[1,3,5,7,9] + libero_10[1,3,5,7,9]
+```
+
+`--shard-by suite`:
+
+Whole suites per GPU. Mostly useful for A/B comparison or when you
+specifically want to measure per-suite throughput in isolation. Expect
+worse wall time when suite max_steps differ.
+
+```text
+GPU 0: all 10 tasks of libero_spatial
+GPU 1: all 10 tasks of libero_object
+GPU 2: all 10 tasks of libero_goal
+GPU 3: all 10 tasks of libero_10
+```
+
+To benchmark them:
+
+```bash
+python scripts/eval_libero_plus_multi_gpu.py --output-dir outputs/bench_task  --shard-by task  -- ...
+python scripts/eval_libero_plus_multi_gpu.py --output-dir outputs/bench_suite --shard-by suite -- ...
+diff <(jq '.sweep_elapsed_s' outputs/bench_task/sweep_timing.json) \
+     <(jq '.sweep_elapsed_s' outputs/bench_suite/sweep_timing.json)
+```
+
+## Outputs
+
+After a sweep completes, `--output-dir` contains:
+
+```
+outputs/eval/libero_plus_multi/
+├── eval_info.json          # merged report across all shards
+├── sweep_timing.json       # wall-time benchmarking record
+├── shard_00_gpu_0/
+│   ├── shard.log           # full stdout/stderr from this shard
+│   ├── shard_timing.json   # per-suite timings + rc
+│   ├── plan.json           # the (suite, task_ids) plan this shard ran
+│   ├── eval_info.json      # this shard's eval_info (worker-mode layout)
+│   └── videos/<suite>/...  # rollouts, if --max-episodes-rendered > 0
+├── shard_01_gpu_1/...
+└── ...
+```
+
+The top-level `eval_info.json` mirrors the shape produced by the upstream
+`lerobot-eval`:
+
+```json
+{
+  "overall": {"n_episodes": 400, "pc_success": 78.5, ...},
+  "per_group": {
+    "libero_spatial": {"n_episodes": 100, "pc_success": 86.0, ...},
+    "libero_object":  {...},
+    ...
+  },
+  "per_task":  [{"task_group": "...", "task_id": 0, "metrics": {...}}, ...],
+  "shards":    [{"shard": "shard_00_gpu_0", "suite": "libero_spatial", ...}, ...]
+}
+```
+
+## Wall-time summary
+
+The launcher prints (and writes to `sweep_timing.json`):
+
+```
+========== Wall-time summary ==========
+Strategy:        task
+GPUs:            4 (0,1,2,3)
+Sweep wall time: 3624.1s (1.01h)
+Slowest shard:   3592.4s (slowest/fastest = 1.02× — closer to 1.00 = better balanced)
+Sequential est.: 14250.0s → speedup vs 1×GPU ≈ 3.93×
+Per-shard:
+  shard 00 gpu 0: 3592.4s
+  shard 01 gpu 1: 3580.1s
+  shard 02 gpu 2: 3585.7s
+  shard 03 gpu 3: 3580.0s
+```
+
+Read it as:
+
+- **`Sweep wall time`** — what you actually waited.
+- **`slowest/fastest`** — load balance. 1.0 = perfect; ≥ 1.5 means
+  `--shard-by task` is being defeated by uneven suite costs (rare with
+  the 4 default suites; more likely if you mix `libero_90` in).
+- **`speedup vs 1×GPU`** — sum of per-shard rollout time divided by wall
+  time. A 4-GPU sweep should be near 4× if shards are balanced.
+
+## Performance expectations
+
+Single H100, full LIBERO-plus default sweep (4 suites × 10 tasks ×
+10 episodes): ~5 days.
+
+With this launcher on **N H100s, you should see ~5 days / N**, modulo:
+
+- ~30–120s per shard for policy load + GPU init (paid once per shard,
+  not per suite).
+- A few seconds per `(shard, suite)` for env setup.
+- Slight imbalance from `slowest/fastest` ratio (typically < 1.05).
+
+So 8 H100s → ~15h. 4 H100s → ~30h. The numbers in `sweep_timing.json`
+will tell you exactly where the time went.
+
+If you have spare VRAM headroom on each H100, also pass
+`--eval.batch_size=N --eval.use_async_envs=true` in the forwarded args
+to vectorize within each task on top of the cross-task sharding.
+
+## Recovering from partial failures
+
+Shards run independently. If one fails (preempted, OOM, EGL crash on a
+flaky GPU), the others continue and write their results. To re-aggregate
+without rerunning successful shards:
+
+```bash
+python scripts/eval_libero_plus_multi_gpu.py \
+    --output-dir outputs/eval/libero_plus_multi \
+    --merge-only
+```
+
+To rerun only the failed shard, look at `shard_NN_gpu_X/plan.json`,
+write its plan as `--task-ids` for the launcher, restrict GPUs to the
+one you want to use, and run the launcher again into a temp directory —
+then `cp -r` the new shard back into the original `--output-dir` and
+`--merge-only`.
+
+## Troubleshooting
+
+### Only one GPU shows activity, others are idle or crash
+
+EGL collision. Check that `MUJOCO_EGL_DEVICE_ID` is being set per shard
+(it should be — the launcher does this). Run `--check-egl` to confirm
+each GPU can independently bind a context. On heterogeneous boxes (iGPU
++ dGPU, multi-vendor) the EGL-to-CUDA index mapping can drift; override
+`MUJOCO_EGL_DEVICE_ID` in the parent shell before launching.
+
+### `EGL_BAD_DISPLAY` / `EGL_BAD_CONTEXT` in shard logs
+
+Same root cause. Confirm `MUJOCO_GL=egl` is set, the EGL device id is
+right, and that `mujoco` is importable on the H100.
+
+### Worker exits rc=2 with "These forwarded args aren't supported"
+
+You passed a draccus flag the worker doesn't translate. Either remove it,
+or use `--use-lerobot-eval` to fall back to the per-suite CLI path
+(slower — pays model load per suite — but accepts every draccus flag).
+
+### Push to fork rejected: "without `workflow` scope"
+
+Unrelated to eval — only matters if you're publishing your fork. The
+upstream lerobot repo ships `.github/workflows/*`, so the first push to
+an empty fork creates workflow files and needs a PAT with both `repo`
+and `workflow` scopes. Either add the scope to your PAT or fork through
+GitHub's UI (which copies workflows server-side).
+
+### "5 days" smell test
+
+Before launching, multiply `n_episodes × max_steps × n_tasks ×
+n_suites / fps`. For 10 episodes × ~350 mean max-steps × 10 tasks × 4
+suites at 30 fps: ~4.6 hours of pure simulation per GPU. Add policy
+inference time (varies wildly with model size) and you get the single-GPU
+baseline. The launcher should bring this to `baseline / num_gpus`.
+
+## See also
+
+- [LIBERO-plus](./libero_plus) — benchmark, policy setup, training data
+- [LIBERO](./libero) — the underlying suites
+- `scripts/eval_libero_plus_multi_gpu.py` — launcher source
+- `scripts/eval_libero_plus_shard_worker.py` — in-process worker source
