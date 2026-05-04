@@ -292,40 +292,50 @@ def _shard_worker_path() -> Path:
     return Path(__file__).resolve().parent / "eval_libero_plus_shard_worker.py"
 
 
-def _shard_env(gpu_id: str, all_gpus: list[str]) -> dict[str, str]:
+def _shard_env(
+    gpu_id: str, all_gpus: list[str], egl_filter: bool = False
+) -> dict[str, str]:
     """Per-shard environment: pin CUDA + EGL to the same physical GPU.
 
-    Why we *don't* filter CUDA_VISIBLE_DEVICES per shard
-    ----------------------------------------------------
-    Two earlier attempts both failed against the actual H100 + LIBERO stack:
+    Two modes, gated by ``egl_filter``:
 
-    1. ``CVD=$gpu_id``, ``MEDI=$gpu_id`` (original) → MuJoCo's *C++* EGL init
-       (the ``mujoco.Renderer`` path used by ``--check-egl``) computes
-       ``numDevices`` from the CUDA-filtered EGL enumeration (=1) and rejects
-       ``MEDI=N`` for any N>0 with "must be an integer between 0 and 0
-       (inclusive)".
-    2. ``CVD=$gpu_id``, ``MEDI=0`` → MuJoCo's *Python* EGL wrapper (the path
-       LIBERO/robosuite go through during real eval) parses
-       ``CUDA_VISIBLE_DEVICES`` and requires MEDI to be one of the values in
-       it. ``0 ∉ {1}`` fails with "needs to be set to one of the device IDs
-       specified in CUDA_VISIBLE_DEVICES."
+    ``egl_filter=False`` (default, "cuda-rank" mode)
+    ------------------------------------------------
+    For typical NVIDIA workstations where EGL respects ``CUDA_VISIBLE_DEVICES``.
+    Keeps CVD as the *full* set of selected GPUs across all shards (so MuJoCo's
+    Python wrapper can membership-check ``MEDI`` against the CVD list and
+    renumber internally), sets ``MEDI=$gpu_id`` (a value in CVD), and isolates
+    per-shard CUDA via ``torch.cuda.set_device(rank)`` inside the worker. The
+    launcher forwards ``--cuda-rank`` for that.
 
-    Both checks can't be satisfied simultaneously when CVD is filtered to a
-    single id per shard. The fix is to keep CVD as the *full* set of selected
-    GPUs across all shards (so the Python wrapper sees a list it can
-    membership-check, and the C++ ``numDevices`` is large enough), and
-    isolate per-shard CUDA via ``torch.cuda.set_device(rank)`` inside the
-    worker. ``MEDI=$gpu_id`` then matches one of the CVD values, the wrapper
-    renumbers it to its index, and the C++ side is happy too.
+    ``egl_filter=True`` ("cvd-filter" mode, for managed clusters)
+    -------------------------------------------------------------
+    For hosts where EGL exposes only 1 device per process *regardless* of
+    ``CUDA_VISIBLE_DEVICES`` — typical of managed GPU clusters / containers
+    that decouple EGL device enumeration from CUDA. Even with ``CVD=0,1,2,3``,
+    ``eglQueryDevicesEXT`` returns 1, so robosuite's count check rejects any
+    ``MEDI > 0``. The only working layout in that case is to filter CVD to a
+    single GPU per shard (so each shard's "EGL device 0" maps to that physical
+    card) and set ``MEDI=0``. ``--cuda-rank`` is unnecessary here because the
+    CVD filter already isolates CUDA: the shard sees ``cuda:0 == physical $gpu_id``.
 
-    The shard worker MUST call ``torch.cuda.set_device`` before any CUDA
-    allocation; we forward ``--cuda-rank`` so it can.
+    Detect the right mode for a host by running::
+
+        from robosuite.renderers.context.egl_context import \
+            create_initialized_egl_device_display
+        # Try device_id=1 with CVD=0,1,2,3. If it fails with "0 and 0
+        # (inclusive)", the host needs egl_filter=True.
     """
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = ",".join(all_gpus)
     env.setdefault("MUJOCO_GL", "egl")
-    env["MUJOCO_EGL_DEVICE_ID"] = gpu_id
-    env["EGL_DEVICE_ID"] = gpu_id
+    if egl_filter:
+        env["CUDA_VISIBLE_DEVICES"] = gpu_id
+        env["MUJOCO_EGL_DEVICE_ID"] = "0"
+        env["EGL_DEVICE_ID"] = "0"
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(all_gpus)
+        env["MUJOCO_EGL_DEVICE_ID"] = gpu_id
+        env["EGL_DEVICE_ID"] = gpu_id
     return env
 
 
@@ -372,6 +382,7 @@ def run_shard_worker(
     dry_run: bool,
     rc_holder: list[int],
     timing_holder: list[dict] | None = None,
+    egl_filter: bool = False,
 ) -> None:
     """Spawn one Python worker per shard. Worker loads the policy ONCE
     and iterates the shard's (suite, task_ids) plan in-process, so model
@@ -384,16 +395,21 @@ def run_shard_worker(
     plan_file = shard_dir / "plan.json"
     plan_file.write_text(json.dumps(plan, indent=2))
 
-    env = _shard_env(gpu_id, all_gpus)
-    cuda_rank = _cuda_rank_in(gpu_id, all_gpus)
+    env = _shard_env(gpu_id, all_gpus, egl_filter=egl_filter)
     cmd = [
         sys.executable,
         str(_shard_worker_path()),
         f"--plan-file={plan_file}",
         f"--output-dir={shard_dir}",
-        f"--cuda-rank={cuda_rank}",
         *worker_args,
     ]
+    # In cuda-rank mode the worker must call torch.cuda.set_device(rank) so
+    # tensors land on the right physical GPU after CVD reordering. In
+    # egl-filter mode CVD is already filtered to one card, so cuda:0 IS the
+    # right physical GPU; --cuda-rank would be a no-op (and asking for >0
+    # would error since torch only sees 1 device).
+    if not egl_filter:
+        cmd.insert(4, f"--cuda-rank={_cuda_rank_in(gpu_id, all_gpus)}")
 
     started = time.time()
     rc = 0
@@ -674,6 +690,52 @@ def check_egl_per_gpu(gpus: list[str]) -> list[tuple[str, bool, str]]:
     return results
 
 
+def check_egl_per_gpu_filtered(gpus: list[str]) -> list[tuple[str, bool, str]]:
+    """Filter-mode pre-flight: for each GPU, spawn a child with the egl-filter
+    env layout (CVD=$gpu_id, MEDI=0) and call robosuite's own EGL helper —
+    the *same code path* eval will use when robosuite creates the offscreen
+    renderer. This catches host configs where only EGL device 0 is visible
+    and rejects MEDI>0.
+    """
+    snippet = (
+        "import os, sys, json\n"
+        "os.environ.setdefault('MUJOCO_GL', 'egl')\n"
+        "try:\n"
+        "    from robosuite.renderers.context.egl_context import (\n"
+        "        create_initialized_egl_device_display,\n"
+        "    )\n"
+        "    create_initialized_egl_device_display(device_id=0)\n"
+        "    print(json.dumps({'ok': True,\n"
+        "        'cuda_visible': os.environ.get('CUDA_VISIBLE_DEVICES'),\n"
+        "        'egl': os.environ.get('MUJOCO_EGL_DEVICE_ID')}))\n"
+        "except Exception as e:\n"
+        "    print(json.dumps({'ok': False, 'err': repr(e)}))\n"
+        "    sys.exit(1)\n"
+    )
+    results: list[tuple[str, bool, str]] = []
+    for gpu in gpus:
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = gpu
+        env["MUJOCO_GL"] = "egl"
+        env["MUJOCO_EGL_DEVICE_ID"] = "0"
+        env["EGL_DEVICE_ID"] = "0"
+        try:
+            out = subprocess.check_output(
+                [sys.executable, "-c", snippet],
+                env=env,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=60,
+            )
+            last = out.strip().splitlines()[-1] if out.strip() else "{}"
+            results.append((gpu, True, last))
+        except subprocess.CalledProcessError as e:
+            results.append((gpu, False, e.output.strip().splitlines()[-1] if e.output else repr(e)))
+        except Exception as e:
+            results.append((gpu, False, repr(e)))
+    return results
+
+
 def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     if "--" in argv:
         sep = argv.index("--")
@@ -747,6 +809,19 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         "launching the full sweep. Cheap (~1s/GPU). Recommended on a fresh "
         "host because EGL device→CUDA device mapping can drift.",
     )
+    p.add_argument(
+        "--egl-filter",
+        action="store_true",
+        help="Switch to per-shard CUDA_VISIBLE_DEVICES filtering with "
+        "MUJOCO_EGL_DEVICE_ID=0. Use this on managed clusters / containers "
+        "where the host exposes only 1 EGL device per process regardless of "
+        "CVD (the default cuda-rank mode would have every shard's robosuite "
+        "EGL collide on the same card). Detect this case by running, with "
+        "CVD=0,1,2,3, robosuite's create_initialized_egl_device_display "
+        "for device_id in 0..N-1 — if only device_id=0 succeeds, use "
+        "--egl-filter. Pre-flight (--check-egl) is automatically routed "
+        "through robosuite's helper in this mode.",
+    )
 
     ns = p.parse_args(head[1:])  # head[0] is the script path
     return ns, forwarded
@@ -784,18 +859,27 @@ def main(argv: list[str] | None = None) -> int:
     log.info("Using GPUs: %s", gpus)
 
     if args.check_egl:
-        log.info("Checking EGL binding per GPU (this catches the multi-GPU "
-                 "collision failure mode before launching the full sweep)...")
-        results = check_egl_per_gpu(gpus)
+        log.info(
+            "Checking EGL binding per GPU (mode: %s)...",
+            "egl-filter" if args.egl_filter else "cuda-rank",
+        )
+        if args.egl_filter:
+            results = check_egl_per_gpu_filtered(gpus)
+        else:
+            results = check_egl_per_gpu(gpus)
         bad = [(g, msg) for g, ok, msg in results if not ok]
         for gpu, ok, msg in results:
             log.info("  GPU %s: %s %s", gpu, "OK" if ok else "FAIL", msg)
         if bad:
-            log.error("EGL check failed on %d GPU(s). Aborting before sweep. "
-                      "Fix: confirm `mujoco` is importable and that the EGL "
-                      "device id maps to the same physical card as CUDA. "
-                      "You may need to override MUJOCO_EGL_DEVICE_ID per GPU "
-                      "in the parent shell.", len(bad))
+            log.error(
+                "EGL check failed on %d GPU(s). Aborting before sweep.%s",
+                len(bad),
+                "" if args.egl_filter else (
+                    " If only GPU 0 succeeds and others fail with 'between 0 "
+                    "and 0 (inclusive)', the host exposes only 1 EGL device "
+                    "per process regardless of CVD — re-run with --egl-filter."
+                ),
+            )
             return 2
 
     log.info("Probing suite sizes...")
@@ -818,11 +902,18 @@ def main(argv: list[str] | None = None) -> int:
     # dry run still validates user input. Otherwise typos in forwarded args
     # only surface after a real launch.
     if args.use_lerobot_eval:
-        log.info(
-            "Mode: legacy lerobot-eval (one subprocess per (shard, suite); "
-            "model loaded per-suite — slower)."
-        )
+        if args.egl_filter:
+            log.info(
+                "Mode: legacy lerobot-eval (egl-filter mode is the same env "
+                "layout this path already uses — CVD per shard, MEDI=$gpu_id)."
+            )
+        else:
+            log.info(
+                "Mode: legacy lerobot-eval (one subprocess per (shard, suite); "
+                "model loaded per-suite — slower)."
+            )
         shard_runner = run_shard_per_suite
+        runner_kwargs: dict = {}
         runner_args: tuple = (forwarded,)
     else:
         worker_args, unknown = _translate_to_worker_args(forwarded)
@@ -837,10 +928,14 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         log.info(
             "Mode: in-process worker (model loaded ONCE per shard — fast). "
-            "Translated forwarded args: %s",
+            "EGL: %s. Translated forwarded args: %s",
+            "egl-filter (single-CVD per shard, MEDI=0)"
+            if args.egl_filter
+            else "cuda-rank (full-CVD shared, MEDI=$gpu_id, set_device(rank))",
             worker_args,
         )
         shard_runner = run_shard_worker
+        runner_kwargs = {"egl_filter": args.egl_filter}
         runner_args = (worker_args,)
 
     if args.dry_run:
@@ -869,6 +964,7 @@ def main(argv: list[str] | None = None) -> int:
                 rc_holder,
                 timing_holder,
             ),
+            kwargs=runner_kwargs,
             daemon=False,
             name=f"shard-{i}-gpu-{gpu}",
         )

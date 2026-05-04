@@ -189,6 +189,19 @@ def test_shard_env_worker_keeps_full_cvd_and_uses_global_egl_id(launcher, gpu_id
     assert env["MUJOCO_GL"] == "egl"
 
 
+@pytest.mark.parametrize("gpu_id", ["0", "1", "2", "3"])
+def test_shard_env_egl_filter_pins_cvd_to_gpu_and_medi_to_zero(launcher, gpu_id):
+    """``--egl-filter`` mode (managed clusters / containers): CVD is filtered
+    to the single GPU, MEDI is forced to 0. This is the only working layout
+    when the host's EGL exposes 1 device per process regardless of CVD.
+    """
+    env = launcher._shard_env(gpu_id, ["0", "1", "2", "3"], egl_filter=True)
+    assert env["CUDA_VISIBLE_DEVICES"] == gpu_id
+    assert env["MUJOCO_EGL_DEVICE_ID"] == "0"
+    assert env["EGL_DEVICE_ID"] == "0"
+    assert env["MUJOCO_GL"] == "egl"
+
+
 def test_shard_env_legacy_filters_cvd_per_shard(launcher):
     """Legacy ``--use-lerobot-eval`` env: filters CVD per shard because the
     spawned ``lerobot-eval`` subprocesses don't know about ``--cuda-rank``.

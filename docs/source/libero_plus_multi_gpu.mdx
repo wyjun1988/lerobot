@@ -142,9 +142,42 @@ python scripts/eval_libero_plus_multi_gpu.py \
 | `--task-ids` | all | `"0,1,2"` or per-suite `"libero_spatial=0,1;libero_10=3,4"` |
 | `--shard-by` | `task` | `task` (round-robin) or `suite` (whole suites per GPU) |
 | `--check-egl` | off | EGL pre-flight per GPU |
+| `--egl-filter` | off | Per-shard CVD filter + `MEDI=0`. Use on managed clusters where the host exposes only 1 EGL device per process regardless of CVD (see "Picking an EGL mode" below) |
 | `--dry-run` | off | Print plan + commands, don't execute |
 | `--merge-only` | off | Skip launching, re-merge existing shard outputs |
 | `--use-lerobot-eval` | off | Legacy mode: spawn `lerobot-eval` per (shard, suite); pays model-load per suite |
+
+## Picking an EGL mode
+
+The launcher has two ways to pin each shard to its GPU. Default is
+`cuda-rank` mode, which works on most NVIDIA workstations. Managed
+clusters (Run:AI, NGC, k8s with NVIDIA GPU operator) often need
+`--egl-filter` instead.
+
+| Mode | Env layout per shard | Use when |
+|---|---|---|
+| `cuda-rank` (default) | `CVD=0,1,2,3` (full), `MEDI=$gpu_id`, worker `set_device(rank)` | EGL respects CVD filtering — typical NVIDIA workstation, full driver access |
+| `--egl-filter` | `CVD=$gpu_id` (single), `MEDI=0` | Host exposes only 1 EGL device per process regardless of CVD — typical managed cluster / container |
+
+**How to tell which one your host needs.** On a fresh box, run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 python3 -c "
+from robosuite.renderers.context.egl_context import \
+    create_initialized_egl_device_display
+for did in range(4):
+    try:
+        create_initialized_egl_device_display(device_id=did)
+        print(f'  device_id={did}: OK')
+    except RuntimeError as e:
+        print(f'  device_id={did}: FAIL — {e}')
+"
+```
+
+If all four `device_id` values succeed → use the default (`cuda-rank`).
+If only `device_id=0` succeeds and the others fail with `"between 0 and
+0 (inclusive)"` → use `--egl-filter`. The launcher's `--check-egl` will
+also tell you this and recommend the flag in its error output.
 
 Forwarded args (after `--`) accepted in default worker mode:
 
