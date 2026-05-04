@@ -151,6 +151,15 @@ def test_translate_bool_false_omits_flag(launcher):
     assert out == []  # `argparse store_true` defaults to False; nothing to forward.
 
 
+def test_translate_max_episodes_rendered(launcher):
+    """Forwarding ``--eval.max_episodes_rendered=N`` must produce
+    ``--max-episodes-rendered=N`` on the worker so videos actually get saved.
+    """
+    out, unknown = launcher._translate_to_worker_args(["--eval.max_episodes_rendered=2"])
+    assert unknown == []
+    assert "--max-episodes-rendered=2" in out
+
+
 def test_translate_unknown_args_are_reported(launcher):
     forwarded = ["--policy.path=/x", "--policy.num_inference_steps=5", "--eval.n_episodes=1"]
     out, unknown = launcher._translate_to_worker_args(forwarded)

@@ -132,7 +132,8 @@ python scripts/eval_libero_plus_multi_gpu.py \
 Forwarded args (after `--`) accepted in default worker mode:
 
 - `--policy.path`, `--policy.device`, `--policy.use_amp`
-- `--eval.n_episodes`, `--eval.batch_size`, `--eval.use_async_envs`
+- `--eval.n_episodes`, `--eval.batch_size`, `--eval.use_async_envs`,
+  `--eval.max_episodes_rendered` (set to >0 to record rollout videos)
 - `--env.control_mode`, `--env.max_parallel_tasks`, `--env.episode_length`
 - `--seed`, `--rename_map`, `--trust_remote_code`
 

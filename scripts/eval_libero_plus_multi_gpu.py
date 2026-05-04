@@ -84,6 +84,11 @@ _WORKER_KNOWN = {
     "--eval.n_episodes": "--n-episodes",
     "--eval.batch_size": "--batch-size",
     "--eval.use_async_envs": "--use-async-envs",  # bool
+    # Pass any positive integer to enable video recording; videos land in
+    # <shard_dir>/videos/<suite>/. With shard_by=task, each (suite, task_id)
+    # tuple lives on exactly one shard, so collecting all videos for a
+    # suite means walking shard_*/videos/<suite>/.
+    "--eval.max_episodes_rendered": "--max-episodes-rendered",
     "--env.control_mode": "--control-mode",
     "--env.max_parallel_tasks": "--max-parallel-tasks",
     "--env.episode_length": "--episode-length",
