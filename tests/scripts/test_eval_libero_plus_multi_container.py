@@ -221,7 +221,7 @@ def test_merge_recomputes_pc_success_from_episode_booleans(mod, tmp_path):
 
     import argparse
 
-    args = argparse.Namespace(output_dir=tmp_path)
+    args = argparse.Namespace(output_dir=tmp_path, skip_perturbation_breakdown=True)
     assert mod.cmd_merge(args) == 0
 
     merged = json.loads((tmp_path / "eval_info.json").read_text())
@@ -255,7 +255,7 @@ def test_merge_tolerates_missing_shards(mod, tmp_path, caplog):
 
     import argparse
 
-    args = argparse.Namespace(output_dir=tmp_path)
+    args = argparse.Namespace(output_dir=tmp_path, skip_perturbation_breakdown=True)
     assert mod.cmd_merge(args) == 0
 
     merged = json.loads((tmp_path / "eval_info.json").read_text())
@@ -266,5 +266,176 @@ def test_merge_tolerates_missing_shards(mod, tmp_path, caplog):
 def test_merge_errors_on_empty_dir(mod, tmp_path):
     import argparse
 
-    args = argparse.Namespace(output_dir=tmp_path)
+    args = argparse.Namespace(output_dir=tmp_path, skip_perturbation_breakdown=True)
     assert mod.cmd_merge(args) == 2
+
+
+# ---------------------------------------------------------------------------
+# Perturbation categorization
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        # Base / unperturbed task
+        ("KITCHEN_SCENE2_open_the_top_drawer", "clean"),
+        # 7 perturbation axes from the LIBERO-plus paper:
+        ("KITCHEN_SCENE_view_top_camera", "camera"),
+        ("KITCHEN_SCENE_language_paraphrase_v1", "language"),
+        ("KITCHEN_SCENE_light_dark", "lighting"),
+        ("KITCHEN_SCENE_tb_3", "background"),
+        ("KITCHEN_SCENE_table_2", "background"),
+        ("KITCHEN_SCENE_add_obj_carrot", "object_added"),
+        ("KITCHEN_SCENE_level1", "object_layout"),
+        ("KITCHEN_SCENE_robot_init_offset", "robot_init"),
+        ("KITCHEN_SCENE_noise_imgnoise_high", "sensor_noise"),
+    ],
+)
+def test_categorize_task_recognizes_libero_plus_perturbation_axes(mod, name, expected):
+    assert mod.categorize_task(name) == expected
+
+
+def test_aggregate_by_perturbation_pools_episode_booleans(mod):
+    """Per-perturbation aggregation must compute pc_success from the underlying
+    per-episode booleans, NOT from per-task means — same unbiased logic the
+    overall and per-suite reports use. With this rule, 1 success / 1 episode
+    on one camera task and 0/3 on another camera task gives 25%, not 12.5%
+    (which a mean-of-means would produce).
+    """
+    per_task = [
+        {
+            "task_group": "libero_spatial",
+            "task_id": 0,
+            "perturbation": "camera",
+            "metrics": {
+                "successes": [True],
+                "sum_rewards": [1.0],
+                "max_rewards": [1.0],
+            },
+        },
+        {
+            "task_group": "libero_spatial",
+            "task_id": 1,
+            "perturbation": "camera",
+            "metrics": {
+                "successes": [False, False, False],
+                "sum_rewards": [0.0, 0.0, 0.0],
+                "max_rewards": [0.0, 0.0, 0.0],
+            },
+        },
+        {
+            "task_group": "libero_spatial",
+            "task_id": 2,
+            "perturbation": "language",
+            "metrics": {
+                "successes": [True, True],
+                "sum_rewards": [1.0, 1.0],
+                "max_rewards": [1.0, 1.0],
+            },
+        },
+    ]
+
+    out = mod._aggregate_by_perturbation(per_task)
+
+    # 1 success / 4 episodes for camera = 25.0
+    assert out["camera"]["n_episodes"] == 4
+    assert out["camera"]["pc_success"] == pytest.approx(25.0)
+
+    # 2 / 2 for language = 100.0
+    assert out["language"]["n_episodes"] == 2
+    assert out["language"]["pc_success"] == pytest.approx(100.0)
+
+
+def test_attach_perturbation_categories_skips_when_libero_missing(mod, monkeypatch):
+    """If LIBERO can't be imported, ``_attach_perturbation_categories`` should
+    return False and leave per_task untouched — the merge step still works,
+    just without the perturbation breakdown."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "libero.libero" or name.startswith("libero"):
+            raise ImportError("simulated: LIBERO not on PYTHONPATH")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    per_task = [
+        {"task_group": "libero_spatial", "task_id": 0, "metrics": {"successes": [True]}}
+    ]
+    assert mod._attach_perturbation_categories(per_task) is False
+    # per_task is untouched (no `perturbation` key was added):
+    assert "perturbation" not in per_task[0]
+
+
+def test_merge_with_perturbation_breakdown_via_monkeypatch(mod, tmp_path, monkeypatch):
+    """End-to-end merge with category breakdown: stub LIBERO's benchmark dict
+    to return tasks with synthetic names, then verify ``per_perturbation`` ends
+    up in the merged report alongside ``per_group``."""
+    _write_shard(
+        tmp_path,
+        "shard_00",
+        [
+            {
+                "task_group": "libero_spatial",
+                "task_id": 0,
+                "metrics": {
+                    "successes": [True, False],
+                    "sum_rewards": [1.0, 0.0],
+                    "max_rewards": [1.0, 0.0],
+                },
+            },
+            {
+                "task_group": "libero_spatial",
+                "task_id": 1,
+                "metrics": {
+                    "successes": [False],
+                    "sum_rewards": [0.0],
+                    "max_rewards": [0.0],
+                },
+            },
+        ],
+    )
+
+    # Stub LIBERO so task_id=0 -> camera, task_id=1 -> language.
+    class _Task:
+        def __init__(self, name):
+            self.name = name
+
+    class _Suite:
+        tasks = [_Task("KITCHEN_view_top"), _Task("KITCHEN_language_paraphrase")]
+
+    fake_benchmark_dict = {"libero_spatial": _Suite}
+
+    import sys
+    import types
+
+    fake_libero = types.ModuleType("libero")
+    fake_libero_libero = types.ModuleType("libero.libero")
+    fake_benchmark = types.ModuleType("libero.libero.benchmark")
+    fake_benchmark.get_benchmark_dict = lambda: fake_benchmark_dict
+    fake_libero_libero.benchmark = fake_benchmark
+    fake_libero.libero = fake_libero_libero
+    monkeypatch.setitem(sys.modules, "libero", fake_libero)
+    monkeypatch.setitem(sys.modules, "libero.libero", fake_libero_libero)
+    monkeypatch.setitem(sys.modules, "libero.libero.benchmark", fake_benchmark)
+
+    import argparse
+
+    args = argparse.Namespace(output_dir=tmp_path, skip_perturbation_breakdown=False)
+    assert mod.cmd_merge(args) == 0
+
+    merged = json.loads((tmp_path / "eval_info.json").read_text())
+    # per_group still works (unchanged):
+    assert merged["per_group"]["libero_spatial"]["n_episodes"] == 3
+    # New per_perturbation breakdown by category:
+    assert "camera" in merged["per_perturbation"]
+    assert "language" in merged["per_perturbation"]
+    # camera = task 0 = 1/2 = 50%
+    assert merged["per_perturbation"]["camera"]["n_episodes"] == 2
+    assert merged["per_perturbation"]["camera"]["pc_success"] == pytest.approx(50.0)
+    # language = task 1 = 0/1 = 0%
+    assert merged["per_perturbation"]["language"]["n_episodes"] == 1
+    assert merged["per_perturbation"]["language"]["pc_success"] == pytest.approx(0.0)

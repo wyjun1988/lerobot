@@ -73,11 +73,123 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
 
 log = logging.getLogger("multi_container")
+
+
+# ---------------------------------------------------------------------------
+# LIBERO-plus perturbation categorization
+# ---------------------------------------------------------------------------
+#
+# LIBERO-plus encodes each variant's perturbation in the task filename. Each
+# category corresponds to one axis of the paper's 7 perturbation dimensions.
+# Patterns are matched in order; first hit wins. ``None`` => unperturbed
+# variant (a base task that isn't a perturbation of anything).
+#
+# References:
+#   - LIBERO-plus paper (arXiv:2502.00064) §3 lists the seven axes.
+#   - The init-state suffix-stripping regex in src/lerobot/envs/libero.py:64
+#     covers the language / view / light / table / tb encodings.
+#   - Object-layout variants live under libero_newobj/ and use _add_ / _level
+#     filenames; see src/lerobot/envs/libero.py:78 for the dispatch.
+PERTURBATION_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"_view_"), "camera"),
+    (re.compile(r"_language_"), "language"),
+    (re.compile(r"_light_"), "lighting"),
+    (re.compile(r"_(?:tb|table)_\d+"), "background"),
+    (re.compile(r"_add_"), "object_added"),
+    (re.compile(r"_level\d*"), "object_layout"),
+    (re.compile(r"_robot_"), "robot_init"),
+    (re.compile(r"_noise_"), "sensor_noise"),
+]
+
+
+def categorize_task(task_name: str) -> str:
+    """Map a LIBERO-plus task filename to its perturbation category.
+
+    Returns one of the seven category strings or ``"clean"`` when no known
+    perturbation suffix is present (the unperturbed base variant).
+    """
+    for pat, cat in PERTURBATION_PATTERNS:
+        if pat.search(task_name):
+            return cat
+    return "clean"
+
+
+def _attach_perturbation_categories(per_task: list[dict]) -> bool:
+    """Look up each task's name from LIBERO's benchmark dict and tag with
+    perturbation category. Returns True on success, False if LIBERO can't
+    be imported (in which case per_task is left untouched and the merge
+    silently skips the per-category breakdown).
+    """
+    try:
+        from libero.libero import benchmark  # noqa: PLC0415
+    except ImportError:
+        log.warning(
+            "LIBERO not importable — skipping perturbation-category breakdown. "
+            "Set PYTHONPATH to include LIBERO-plus to enable it."
+        )
+        return False
+
+    bench_dict = benchmark.get_benchmark_dict()
+    suite_tasks: dict[str, list] = {}
+    for t in per_task:
+        suite = t["task_group"]
+        if suite not in suite_tasks:
+            try:
+                suite_tasks[suite] = bench_dict[suite]().tasks
+            except KeyError:
+                log.warning("Suite %s not in LIBERO benchmark dict; skipping.", suite)
+                suite_tasks[suite] = []
+
+    for t in per_task:
+        tasks = suite_tasks.get(t["task_group"], [])
+        tid = t.get("task_id")
+        if tid is None or tid >= len(tasks):
+            t.setdefault("task_name", None)
+            t.setdefault("perturbation", "unknown")
+            continue
+        # `name` is what LIBERO-plus uses; some forks expose the BDDL filename
+        # via `bddl_file` / `init_states_file` instead. Prefer name, fall back.
+        name = getattr(tasks[tid], "name", None) or getattr(
+            tasks[tid], "bddl_file", ""
+        )
+        t["task_name"] = name
+        t["perturbation"] = categorize_task(name)
+    return True
+
+
+def _aggregate_by_perturbation(per_task: list[dict]) -> dict:
+    """Group per-task results by perturbation category and compute pc_success
+    over per-episode booleans (NOT mean-of-task-means — same reason the
+    overall report does it: avoids biasing categories with unequal task counts).
+    """
+    by_cat_succ: dict[str, list[bool]] = defaultdict(list)
+    by_cat_sum: dict[str, list[float]] = defaultdict(list)
+    by_cat_max: dict[str, list[float]] = defaultdict(list)
+    for t in per_task:
+        cat = t.get("perturbation", "unknown")
+        m = t.get("metrics", {})
+        by_cat_succ[cat].extend(m.get("successes", []))
+        by_cat_sum[cat].extend(m.get("sum_rewards", []))
+        by_cat_max[cat].extend(m.get("max_rewards", []))
+
+    def _avg(xs: list[float]) -> float:
+        return float(sum(xs) / len(xs)) if xs else float("nan")
+
+    out: dict[str, dict] = {}
+    for cat, succ in by_cat_succ.items():
+        out[cat] = {
+            "n_episodes": len(succ),
+            "pc_success": 100.0 * sum(succ) / len(succ) if succ else float("nan"),
+            "avg_sum_reward": _avg(by_cat_sum[cat]),
+            "avg_max_reward": _avg(by_cat_max[cat]),
+        }
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -293,9 +405,21 @@ def cmd_merge(args: argparse.Namespace) -> int:
         "avg_sum_reward": _avg(overall_sum),
         "avg_max_reward": _avg(overall_max),
     }
+
+    # LIBERO-plus paper reports per-perturbation breakdown (camera, language,
+    # lighting, background, object_added, object_layout, robot_init,
+    # sensor_noise). The category for each task is encoded in its name; we
+    # look that up from LIBERO's benchmark dict and aggregate alongside the
+    # per-suite breakdown so the final report has both views.
+    per_perturbation: dict[str, dict] = {}
+    if not args.skip_perturbation_breakdown:
+        if _attach_perturbation_categories(per_task):
+            per_perturbation = _aggregate_by_perturbation(per_task)
+
     merged = {
         "overall": overall,
         "per_group": per_group,
+        "per_perturbation": per_perturbation,
         "per_task": per_task,
         "shards": shards_summary,
     }
@@ -304,8 +428,13 @@ def cmd_merge(args: argparse.Namespace) -> int:
     out_path.write_text(json.dumps(merged, indent=2))
     log.info("Wrote merged report -> %s", out_path)
     log.info("Overall: %s", overall)
+    log.info("Per suite (LIBERO suites):")
     for g, agg in per_group.items():
         log.info("  %s: %s", g, agg)
+    if per_perturbation:
+        log.info("Per perturbation category (LIBERO-plus axes):")
+        for cat, agg in sorted(per_perturbation.items()):
+            log.info("  %s: %s", cat, agg)
     return 0
 
 
@@ -354,6 +483,16 @@ def main(argv: list[str] | None = None) -> int:
 
     pm = sub.add_parser("merge", help="Aggregate per-shard outputs into one report.")
     pm.add_argument("--output-dir", type=Path, required=True)
+    pm.add_argument(
+        "--skip-perturbation-breakdown",
+        action="store_true",
+        help="Don't compute the LIBERO-plus per-perturbation aggregation. "
+        "Default: compute it whenever LIBERO is importable (set PYTHONPATH "
+        "to include LIBERO-plus). The breakdown groups tasks by the 7 "
+        "perturbation axes (camera, language, lighting, background, "
+        "object_added, object_layout, robot_init, sensor_noise) plus 'clean' "
+        "for unperturbed bases.",
+    )
 
     args = p.parse_args(argv)
     if args.cmd == "prepare":
