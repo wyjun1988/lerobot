@@ -85,45 +85,80 @@ log = logging.getLogger("multi_container")
 # LIBERO-plus perturbation categorization
 # ---------------------------------------------------------------------------
 #
-# LIBERO-plus encodes each variant's perturbation in the task filename.
-# Patterns are matched in order; first hit wins. The fork we evaluate against
-# defines five axes:
+# Two flavors of axis encoding in this fork's task filenames:
 #
-#   camera         — _view_*   (alternate camera viewpoints)
-#   background     — _tb_N / _table_N  (table textures / scene background)
-#   lighting       — _light_*  (lighting changes)
-#   object_added   — _add_*    (extra distractor objects, layout in libero_newobj/)
-#   object_layout  — _level*   (alternate object placements, also in libero_newobj/)
+# 1. STRUCTURED (every task carries a value, default = unperturbed):
+#    ``..._language_<L>_view_<X>_<Y>_<Z>_<W>_<V>_initstate_<I>``
+#    Where the *defaults* (= "no perturbation") are:
+#      language   = "0"
+#      view       = "0_0_100_0_0"  (camera at canonical pose)
+#      initstate  = "0"
+#    A non-default value on any of these axes => that's the perturbation.
 #
-# Tasks without any of these suffixes are unperturbed bases ("clean").
+#    Example: ``..._language_1_view_0_0_100_0_0_initstate_0`` is a *language*
+#    variant, NOT a camera variant — view and initstate are both at default.
 #
-# Note: the published LIBERO-plus paper lists seven axes including language
-# paraphrases, robot initial states, and sensor noise — those aren't in this
-# fork's task filenames (probably injected at runtime in other forks). If your
-# fork adds more axes, append patterns here and the merge will pick them up
-# automatically; tasks with new suffixes will simply land in "clean" until
-# their pattern is registered.
+# 2. SUFFIX-BASED (presence alone signals the perturbation):
+#      _light_*       => lighting
+#      _tb_N / _table_N => background
+#      _add_*         => object_added
+#      _level<N>      => object_layout
 #
-# Cross-reference: src/lerobot/envs/libero.py:64 has a similar regex used to
-# strip these suffixes when locating the shared init-state file on disk.
-PERTURBATION_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"_view_"), "camera"),
+# Categorization policy: structured axes are checked first (in priority order
+# language > camera > robot_init), then suffix axes. First hit wins, since
+# LIBERO-plus typically isolates one perturbation per task variant.
+#
+# If a single task variant ever combines axes (e.g. perturbed view AND a
+# _light_ suffix), the per_task entry's ``perturbation`` field will reflect
+# only the highest-priority axis — that's an underestimate of stress on the
+# policy and worth flagging if this becomes common; check ``per_task`` raw
+# names with the verify-count probe.
+LIBERO_PLUS_DEFAULTS: dict[str, str] = {
+    "language": "0",
+    "view": "0_0_100_0_0",
+    "initstate": "0",
+}
+
+_LANGUAGE_RE = re.compile(r"_language_(\d+)(?:_|$)")
+_VIEW_RE = re.compile(r"_view_(\d+_\d+_\d+_\d+_\d+)(?:_|$)")
+_INITSTATE_RE = re.compile(r"_initstate_(\d+)(?:_|$)")
+
+SUFFIX_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"_(?:tb|table)_\d+"), "background"),
     (re.compile(r"_light_"), "lighting"),
     (re.compile(r"_add_"), "object_added"),
-    (re.compile(r"_level\d*"), "object_layout"),
+    (re.compile(r"_level\d+"), "object_layout"),
 ]
 
 
 def categorize_task(task_name: str) -> str:
     """Map a LIBERO-plus task filename to its perturbation category.
 
-    Returns one of the five category strings or ``"clean"`` when no known
-    perturbation suffix is present (the unperturbed base variant).
+    Returns one of:
+      - ``language`` / ``camera`` / ``robot_init`` (structured axes,
+        non-default value)
+      - ``background`` / ``lighting`` / ``object_added`` / ``object_layout``
+        (suffix-based axes)
+      - ``clean`` (every structured axis at default and no suffix matches)
     """
-    for pat, cat in PERTURBATION_PATTERNS:
+    # 1. Structured axes — check value vs default.
+    lang_m = _LANGUAGE_RE.search(task_name)
+    if lang_m and lang_m.group(1) != LIBERO_PLUS_DEFAULTS["language"]:
+        return "language"
+
+    view_m = _VIEW_RE.search(task_name)
+    if view_m and view_m.group(1) != LIBERO_PLUS_DEFAULTS["view"]:
+        return "camera"
+
+    init_m = _INITSTATE_RE.search(task_name)
+    if init_m and init_m.group(1) != LIBERO_PLUS_DEFAULTS["initstate"]:
+        return "robot_init"
+
+    # 2. Suffix-based axes.
+    for pat, cat in SUFFIX_PATTERNS:
         if pat.search(task_name):
             return cat
+
     return "clean"
 
 

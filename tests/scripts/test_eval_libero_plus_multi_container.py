@@ -278,23 +278,53 @@ def test_merge_errors_on_empty_dir(mod, tmp_path):
 @pytest.mark.parametrize(
     "name,expected",
     [
-        # Base / unperturbed task
-        ("KITCHEN_SCENE2_open_the_top_drawer", "clean"),
-        # 5 perturbation axes registered for this fork:
-        ("KITCHEN_SCENE_view_top_camera", "camera"),
-        ("KITCHEN_SCENE_light_dark", "lighting"),
-        ("KITCHEN_SCENE_tb_3", "background"),
-        ("KITCHEN_SCENE_table_2", "background"),
-        ("KITCHEN_SCENE_add_obj_carrot", "object_added"),
-        ("KITCHEN_SCENE_level1", "object_layout"),
-        # Suffixes not in this fork's task filenames -> "clean" (no pattern):
-        ("KITCHEN_SCENE_language_paraphrase_v1", "clean"),
-        ("KITCHEN_SCENE_robot_init_offset", "clean"),
-        ("KITCHEN_SCENE_noise_imgnoise_high", "clean"),
+        # Fully default structured triple => unperturbed clean variant.
+        ("pick_up_x_language_0_view_0_0_100_0_0_initstate_0", "clean"),
+        # Non-default language, defaults elsewhere => language perturbation.
+        # This is the failure mode the previous (suffix-only) categorizer hit:
+        # tasks with `_view_0_0_100_0_0` were wrongly classified as `camera`
+        # because the regex matched `_view_` regardless of value. Now we
+        # check the value tuple against the default.
+        ("pick_up_x_language_1_view_0_0_100_0_0_initstate_0", "language"),
+        ("pick_up_x_language_47_view_0_0_100_0_0_initstate_0", "language"),
+        # Non-default view tuple => camera perturbation, even with default lang.
+        ("pick_up_x_language_0_view_5_2_98_3_1_initstate_0", "camera"),
+        # Non-default initstate => robot_init.
+        ("pick_up_x_language_0_view_0_0_100_0_0_initstate_4", "robot_init"),
+        # Suffix-based axes (no structured triple, or perturbation not on any
+        # structured axis):
+        ("KITCHEN_tb_3", "background"),
+        ("KITCHEN_table_2", "background"),
+        ("KITCHEN_light_dark", "lighting"),
+        ("KITCHEN_add_obj_carrot", "object_added"),
+        ("KITCHEN_level1", "object_layout"),
+        # No structured triple AND no suffix match => clean.
+        ("KITCHEN_open_drawer", "clean"),
     ],
 )
 def test_categorize_task_recognizes_libero_plus_perturbation_axes(mod, name, expected):
     assert mod.categorize_task(name) == expected
+
+
+def test_categorize_task_priority_when_multiple_axes_overlap(mod):
+    """If a task has both a non-default structured axis AND a suffix axis,
+    the structured axis wins (priority order: language > camera > robot_init
+    > background > lighting > object_added > object_layout). Combinations
+    are rare in LIBERO-plus; this is documented behavior."""
+    # language perturbed AND background suffix => language wins.
+    assert (
+        mod.categorize_task(
+            "x_language_2_view_0_0_100_0_0_initstate_0_tb_3"
+        )
+        == "language"
+    )
+    # camera perturbed AND lighting suffix => camera wins.
+    assert (
+        mod.categorize_task(
+            "x_language_0_view_5_5_50_0_0_initstate_0_light_dim"
+        )
+        == "camera"
+    )
 
 
 def test_aggregate_by_perturbation_pools_episode_booleans(mod):
