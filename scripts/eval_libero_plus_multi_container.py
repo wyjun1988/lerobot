@@ -366,7 +366,33 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.n_action_steps is not None:
         cmd.append(f"--n-action-steps={args.n_action_steps}")
     log.info("Launching worker for shard %d: %s", args.shard_rank, " ".join(cmd))
-    proc = subprocess.run(cmd, check=False)
+
+    # Capture worker stdout/stderr to <shard_dir>/shard.log so containers
+    # don't lose output when the launching shell closes. Append mode so a
+    # resumed run extends the prior log instead of clobbering it. Each run
+    # is preceded by a header line so it's easy to spot run boundaries
+    # when reading the combined log.
+    import shlex  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+
+    log_path = shard_dir / "shard.log"
+    if args.no_shard_log:
+        log.info("Worker output not redirected (--no-shard-log).")
+        proc = subprocess.run(cmd, check=False)
+        return proc.returncode
+
+    log.info("Worker stdout/stderr -> %s (tail -F to monitor live)", log_path)
+    with log_path.open("a", buffering=1) as logf:
+        logf.write(
+            f"\n===== shard {args.shard_rank} run @ "
+            f"{_time.strftime('%Y-%m-%d %H:%M:%S %z')} =====\n"
+            f"  cmd: {shlex.join(cmd)}\n"
+        )
+        proc = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT, check=False)
+        logf.write(
+            f"===== shard {args.shard_rank} exited rc={proc.returncode} @ "
+            f"{_time.strftime('%Y-%m-%d %H:%M:%S %z')} =====\n"
+        )
     return proc.returncode
 
 
@@ -529,6 +555,13 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         help="Override policy.n_action_steps at eval time (e.g. 10 for pi05).",
+    )
+    pr.add_argument(
+        "--no-shard-log",
+        action="store_true",
+        help="Don't redirect worker stdout/stderr to <shard_dir>/shard.log. "
+        "Default: redirect (so you can `tail -F shard.log` to monitor and "
+        "the log survives the launching shell closing).",
     )
 
     pm = sub.add_parser("merge", help="Aggregate per-shard outputs into one report.")
