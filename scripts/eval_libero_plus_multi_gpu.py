@@ -81,6 +81,10 @@ _WORKER_KNOWN = {
     "--policy.path": "--policy-path",
     "--policy.device": "--device",
     "--policy.use_amp": "--use-amp",  # bool: --policy.use_amp=true → --use-amp
+    # Inference-time override of action-chunk execution length. Useful for
+    # action-chunked policies (pi0, pi05, the pi05_vggt_3d_mix variant): a
+    # smaller value means more frequent re-planning vs more open-loop.
+    "--policy.n_action_steps": "--n-action-steps",
     "--eval.n_episodes": "--n-episodes",
     "--eval.batch_size": "--batch-size",
     "--eval.use_async_envs": "--use-async-envs",  # bool

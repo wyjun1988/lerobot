@@ -151,6 +151,14 @@ def test_translate_bool_false_omits_flag(launcher):
     assert out == []  # `argparse store_true` defaults to False; nothing to forward.
 
 
+def test_translate_n_action_steps(launcher):
+    """``--policy.n_action_steps=10`` (draccus) must translate to
+    ``--n-action-steps=10`` (the worker's argparse flag)."""
+    out, unknown = launcher._translate_to_worker_args(["--policy.n_action_steps=10"])
+    assert unknown == []
+    assert "--n-action-steps=10" in out
+
+
 def test_translate_max_episodes_rendered(launcher):
     """Forwarding ``--eval.max_episodes_rendered=N`` must produce
     ``--max-episodes-rendered=N`` on the worker so videos actually get saved.
