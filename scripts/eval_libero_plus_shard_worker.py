@@ -147,6 +147,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--trust-remote-code", action="store_true")
     p.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Disable suite-level resume. Default: if eval_info.json already "
+        "exists in --output-dir, skip suites that completed cleanly (rc=0) "
+        "in the prior run and continue from where it left off. Pass this to "
+        "force a full restart (overwrites prior eval_info.json from scratch).",
+    )
+    p.add_argument(
         "--n-action-steps",
         type=int,
         default=None,
@@ -241,14 +249,70 @@ def main(argv: list[str] | None = None) -> int:
     autocast_ctx = (
         torch.autocast(device_type=device.type) if policy_cfg.use_amp else nullcontext()
     )
+
+    out_path = args.output_dir / "eval_info.json"
+
+    # Resume support: if a previous run wrote eval_info.json with some
+    # suites completed, pick up from there. Skip-key is
+    # ``(suite, sorted(task_ids))`` so re-running with a different
+    # --task-ids selection forces a re-run (the new suite entry won't
+    # match the old completed key).
     per_task: list[dict] = []
     suite_runs: list[dict] = []
+    completed_keys: set[tuple[str, tuple[int, ...]]] = set()
+    if out_path.exists() and not args.no_resume:
+        try:
+            prev = json.loads(out_path.read_text())
+            for run in prev.get("suite_runs", []):
+                if run.get("rc") == 0:
+                    # Old runs may not have stored task_ids; fall back to a
+                    # name-only match in that case.
+                    tids = tuple(sorted(run.get("task_ids", [])))
+                    completed_keys.add((run["suite"], tids))
+            # Carry forward per_task / suite_runs from completed work so
+            # the rewritten eval_info.json after this run includes them.
+            per_task = list(prev.get("per_task", []))
+            suite_runs = [r for r in prev.get("suite_runs", []) if r.get("rc") == 0]
+            if completed_keys:
+                log.info(
+                    "Resume: skipping %d already-completed suite(s): %s",
+                    len(completed_keys),
+                    sorted(completed_keys),
+                )
+        except (json.JSONDecodeError, KeyError) as e:
+            log.warning("Existing eval_info.json unparseable (%s); starting fresh.", e)
+            per_task, suite_runs, completed_keys = [], [], set()
+
+    def _flush_eval_info(rollout_total_s: float) -> None:
+        """Write the current eval_info.json. Called after every suite so a
+        crash mid-shard doesn't lose completed-suite results."""
+        out = {
+            **_aggregate_global(per_task),
+            "per_task": per_task,
+            "suite_runs": suite_runs,
+            "worker_timing": {
+                "policy_load_s": load_s,
+                "rollout_total_s": rollout_total_s,
+                "n_suites": len(plan),
+            },
+        }
+        # Atomic-ish write: write to a temp file then rename, so a
+        # mid-write crash doesn't leave a half-baked JSON behind.
+        tmp = out_path.with_suffix(".json.tmp")
+        with tmp.open("w") as f:
+            json.dump(out, f, indent=2)
+        tmp.replace(out_path)
+
     started = time.time()
     rc = 0
 
     with torch.no_grad(), autocast_ctx:
         for suite, task_ids in plan:
             task_ids = list(task_ids)
+            key = (suite, tuple(sorted(task_ids)))
+            if key in completed_keys:
+                log.info("Suite=%s already completed in previous run; skipping.", suite)
+                continue
             log.info("Suite=%s n_tasks=%d ids=%s", suite, len(task_ids), task_ids)
             t0 = time.time()
             suite_cfg = _build_env_cfg(suite, task_ids, args)
@@ -297,12 +361,14 @@ def main(argv: list[str] | None = None) -> int:
                 suite_runs.append(
                     {
                         "suite": suite,
+                        "task_ids": task_ids,
                         "n_tasks": len(task_ids),
                         "elapsed_s": time.time() - t0,
                         "rc": 1,
                         "overall": None,
                     }
                 )
+                _flush_eval_info(time.time() - started)
                 continue
 
             elapsed = time.time() - t0
@@ -311,6 +377,7 @@ def main(argv: list[str] | None = None) -> int:
             suite_runs.append(
                 {
                     "suite": suite,
+                    "task_ids": task_ids,
                     "n_tasks": len(task_ids),
                     "elapsed_s": elapsed,
                     "rc": 0,
@@ -318,22 +385,15 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             log.info("Suite=%s done in %.1fs overall=%s", suite, elapsed, info.get("overall"))
+            # Flush after every successful suite so a mid-shard crash from
+            # later suites still preserves what we've completed. The merge
+            # step + resume rely on this file being written incrementally.
+            _flush_eval_info(time.time() - started)
 
     total_s = time.time() - started
+    # Final flush captures the last suite's results plus updated total_s.
+    _flush_eval_info(total_s)
     aggregated = _aggregate_global(per_task)
-    out = {
-        **aggregated,
-        "per_task": per_task,
-        "suite_runs": suite_runs,
-        "worker_timing": {
-            "policy_load_s": load_s,
-            "rollout_total_s": total_s,
-            "n_suites": len(plan),
-        },
-    }
-    out_path = args.output_dir / "eval_info.json"
-    with out_path.open("w") as f:
-        json.dump(out, f, indent=2)
     log.info("Wrote %s", out_path)
     log.info("Overall: %s", aggregated["overall"])
     log.info(
