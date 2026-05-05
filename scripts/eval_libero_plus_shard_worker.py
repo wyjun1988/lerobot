@@ -147,6 +147,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--trust-remote-code", action="store_true")
     p.add_argument(
+        "--n-action-steps",
+        type=int,
+        default=None,
+        help="Override policy.n_action_steps at eval time — number of actions "
+        "from each predicted action chunk that get executed before the policy "
+        "is re-queried. Smaller values = more frequent re-planning (more "
+        "compute, potentially more reactive). Larger values = open-loop "
+        "execution of more steps. Default: None (use whatever the saved "
+        "policy config has).",
+    )
+    p.add_argument(
         "--cuda-rank",
         type=int,
         default=None,
@@ -184,6 +195,21 @@ def main(argv: list[str] | None = None) -> int:
     policy_cfg.pretrained_path = Path(args.policy_path)
     policy_cfg.device = args.device
     policy_cfg.use_amp = bool(args.use_amp)
+    if args.n_action_steps is not None:
+        if not hasattr(policy_cfg, "n_action_steps"):
+            log.warning(
+                "Policy config %s has no n_action_steps attribute; "
+                "--n-action-steps=%d will be ignored.",
+                type(policy_cfg).__name__,
+                args.n_action_steps,
+            )
+        else:
+            log.info(
+                "Override n_action_steps: %s -> %d",
+                policy_cfg.n_action_steps,
+                args.n_action_steps,
+            )
+            policy_cfg.n_action_steps = args.n_action_steps
 
     device = get_safe_torch_device(policy_cfg.device, log=True)
     torch.backends.cudnn.benchmark = True

@@ -363,6 +363,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         cmd.append("--use-amp")
     if args.rename_map is not None:
         cmd.append(f"--rename-map={args.rename_map}")
+    if args.n_action_steps is not None:
+        cmd.append(f"--n-action-steps={args.n_action_steps}")
     log.info("Launching worker for shard %d: %s", args.shard_rank, " ".join(cmd))
     proc = subprocess.run(cmd, check=False)
     return proc.returncode
@@ -522,6 +524,12 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--batch-size", type=int, default=1)
     pr.add_argument("--max-episodes-rendered", type=int, default=0)
     pr.add_argument("--rename-map", default=None)
+    pr.add_argument(
+        "--n-action-steps",
+        type=int,
+        default=None,
+        help="Override policy.n_action_steps at eval time (e.g. 10 for pi05).",
+    )
 
     pm = sub.add_parser("merge", help="Aggregate per-shard outputs into one report.")
     pm.add_argument("--output-dir", type=Path, required=True)
